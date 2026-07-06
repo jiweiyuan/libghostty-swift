@@ -155,6 +155,37 @@
             super.layout()
             core.fitToSize()
             core.requestImmediateTick()
+            // A SwiftUI/AppKit host can leave this view at an intermediate frame
+            // after an *animated or programmatic* grow (window zoom, sidebar
+            // toggle): the last `layout()` we get carries mid-animation bounds and
+            // no further pass arrives, so the surface stays sized to the stale,
+            // smaller width and the content is boxed into a corner of the window.
+            // Re-derive metrics one runloop later — by then the host's frame has
+            // settled — so the final size is always captured. Coalesced so a burst
+            // of layout passes schedules a single catch-up.
+            scheduleSettleResync()
+        }
+
+        override open func viewDidEndLiveResize() {
+            super.viewDidEndLiveResize()
+            // AppKit guarantees the frame is final here, so an interactive
+            // window/split drag that ended between layout passes still lands at
+            // the true size (the drag-out-to-grow case).
+            core.fitToSize()
+            core.requestImmediateTick()
+        }
+
+        /// Re-fit on the next runloop turn, once the host layout has settled,
+        /// coalescing repeat requests from a single animation into one catch-up.
+        private func scheduleSettleResync() {
+            guard !settleResyncScheduled else { return }
+            settleResyncScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                settleResyncScheduled = false
+                core.fitToSize()
+                core.requestImmediateTick()
+            }
         }
 
         override open func viewDidChangeBackingProperties() {

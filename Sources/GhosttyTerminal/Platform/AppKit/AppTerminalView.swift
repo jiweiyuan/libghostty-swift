@@ -19,6 +19,9 @@
         var lastPointerSelectionRect: CGRect?
         var pendingSelectionMenuPoint: CGPoint?
         var onFocusChange: ((Bool) -> Void)?
+        /// Coalesces the deferred re-sync scheduled from `layout()`. See
+        /// `scheduleSettleResync` in `AppTerminalView+Lifecycle`.
+        var settleResyncScheduled = false
 
         open weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }
