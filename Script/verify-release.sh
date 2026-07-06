@@ -44,7 +44,8 @@ if [ -z "$download_url" ] || [ -z "$checksum" ]; then
     exit 1
 fi
 
-expected_url="https://github.com/Lakr233/libghostty-spm/releases/download/$STORAGE_RELEASE_TAG/$ASSET_NAME"
+repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+expected_url="https://github.com/$repo/releases/download/$STORAGE_RELEASE_TAG/$ASSET_NAME"
 if [ "$download_url" != "$expected_url" ]; then
     echo "[!] Package.swift download URL does not match storage release"
     echo "    expected: $expected_url"
