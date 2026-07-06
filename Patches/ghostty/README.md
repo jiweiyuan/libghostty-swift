@@ -20,14 +20,15 @@ This patch workflow exists so we can carry host-managed IO work required for
 sandboxed iOS, macOS, and Mac Catalyst integration without hiding upstream
 modifications inside ad-hoc build script edits.
 
-## Disabled patches
+## Rebase notes
 
-- `0002-host-managed-io.patch` — **dropped, upstreamed.** As of ghostty
-  `2da015c` (July 2026) the host-managed IO backend lives in ghostty proper:
-  the C API (`ghostty_surface_write_buffer`, `ghostty_surface_process_exit`, the
-  `receive_buffer`/`receive_resize` callbacks and the `GHOSTTY_SURFACE_IO_BACKEND_*`
-  enum), `src/termio/HostManaged.zig`, and the `Surface.zig` wiring are all
-  present natively with signatures identical to what this patch added, so the
-  `GhosttyTerminal` InMemory backend compiles against upstream unchanged. Kept
-  for reference under `Patches/ghostty-disabled/`; re-enable only if building an
-  older ghostty ref that predates upstreaming.
+- `0002-host-managed-io.patch` — rebased onto ghostty `2da015c` (July 2026,
+  the VT-throughput commit #13220). Host-managed IO is **not** upstream; this
+  patch still adds it (the C API `ghostty_surface_write_buffer` /
+  `ghostty_surface_process_exit`, the `receive_buffer`/`receive_resize`
+  callbacks, the `GHOSTTY_SURFACE_IO_BACKEND_*` enum, `src/termio/HostManaged.zig`,
+  and the `Surface.zig` backend switch). The throughput commit only shifted line
+  numbers and inserted a `GHOSTTY_SURFACE_ID` env block inside `Surface.zig`'s
+  init; that block is preserved inside the new `.exec` switch arm. `0001` and
+  `0009` were likewise re-targeted to this ref (renamed `lib_shared`, restructured
+  SIMD flags list).
