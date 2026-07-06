@@ -423,7 +423,7 @@ index 00000000..0d182135
 +    }
 +};
 diff --git a/src/termio/backend.zig b/src/termio/backend.zig
-index c29009ac..226c3cec 100644
+index c29009ac..9857cbd7 100644
 --- a/src/termio/backend.zig
 +++ b/src/termio/backend.zig
 @@ -11,28 +11,34 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
@@ -514,7 +514,15 @@ index c29009ac..226c3cec 100644
          }
      }
  
-@@ -115,10 +132,12 @@ pub const Backend = union(Kind) {
+@@ -108,6 +125,7 @@ pub const Backend = union(Kind) {
+     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+         return switch (self.*) {
+             .exec => |*exec| exec.getProcessInfo(info),
++            .host_managed => null,
+         };
+     }
+ };
+@@ -115,10 +133,12 @@ pub const Backend = union(Kind) {
  /// Termio thread data. See termio.ThreadData for docs.
  pub const ThreadData = union(Kind) {
      exec: termio.Exec.ThreadData,
