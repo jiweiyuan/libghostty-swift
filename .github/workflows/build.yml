@@ -59,11 +59,12 @@ jobs:
             BUILD_REF="$INPUT_REF"
             echo "[*] using provided ghostty ref: $BUILD_REF"
           else
-            BUILD_REF=$(
-              gh api "repos/ghostty-org/ghostty/tags?per_page=100" --paginate --jq '.[].name' |
-                python3 -c 'import re, sys; tags = [line.strip() for line in sys.stdin if re.fullmatch(r"v?\d+\.\d+\.\d+", line.strip())]; print(max(tags, key=lambda tag: tuple(int(part) for part in (tag[1:] if tag.startswith("v") else tag).split("."))), end="")'
-            )
-            echo "[*] upstream ghostty ref: $BUILD_REF"
+            # Track ghostty main HEAD. The perf/lock work lands on main long
+            # before ghostty cuts a semver tag (v1.3.1 was already ~4 months and
+            # 1000+ commits behind main), so tag-tracking would keep us stale.
+            # A manual workflow_dispatch can still pin a tag/commit via ghostty_ref.
+            BUILD_REF="main"
+            echo "[*] tracking ghostty main"
           fi
 
           if [ -z "$BUILD_REF" ]; then
@@ -121,11 +122,26 @@ jobs:
           BUILD_REF="${{ steps.ref.outputs.build_ref }}"
           DO_RELEASE="${{ steps.ref.outputs.do_release }}"
           STORAGE_RELEASE_TAG="${{ steps.ref.outputs.storage_release_tag }}"
+          RESOLVED_SHA="${{ steps.ref.outputs.resolved_sha }}"
+          EVENT="${{ github.event_name }}"
 
           if [ -z "$BUILD_REF" ]; then
             echo "[*] no valid ghostty ref, skipping"
             echo "build_needed=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # On scheduled (auto) runs, skip when ghostty's HEAD has not moved since
+          # the last release — otherwise the weekly cron republishes an identical
+          # binary under a bumped patch tag. Manual dispatch is never skipped here.
+          if [ "$EVENT" = "schedule" ]; then
+            LAST_SHA=$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null \
+              | grep -oiE 'ghostty sha: [0-9a-f]{7,40}' | head -1 | awk '{print $NF}')
+            if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$RESOLVED_SHA" ]; then
+              echo "[*] ghostty sha unchanged since last release ($RESOLVED_SHA), skipping"
+              echo "build_needed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           if [ "$DO_RELEASE" = "true" ] && [ -n "$STORAGE_RELEASE_TAG" ]; then
@@ -138,6 +154,8 @@ jobs:
           fi
 
           echo "build_needed=true" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-target:
     needs: prepare
