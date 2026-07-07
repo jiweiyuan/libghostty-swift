@@ -34,6 +34,7 @@ jobs:
       release_tag: ${{ steps.ref.outputs.release_tag }}
       storage_release_tag: ${{ steps.ref.outputs.storage_release_tag }}
       do_release: ${{ steps.ref.outputs.do_release }}
+      ghostty_describe: ${{ steps.ref.outputs.ghostty_describe }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -85,6 +86,29 @@ jobs:
             exit 1
           fi
 
+          # Ghostty-anchored descriptor, mimics `git describe --tags` without a
+          # full clone, so releases legibly show which ghostty is inside:
+          #   exactly on a tag     -> "v1.3.1"
+          #   N commits past a tag -> "v1.3.1-1260-g634957c"
+          GHOSTTY_LATEST_TAG=$(
+            gh api "repos/ghostty-org/ghostty/tags?per_page=100" --paginate --jq '.[].name' |
+              python3 -c 'import re, sys; tags=[l.strip() for l in sys.stdin if re.fullmatch(r"v?\d+\.\d+\.\d+", l.strip())]; print(max(tags, key=lambda t: tuple(int(p) for p in (t[1:] if t.startswith("v") else t).split("."))) if tags else "", end="")'
+          )
+          GHOSTTY_SHORT_SHA=$(echo "$RESOLVED_SHA" | cut -c1-7)
+          if [ -n "$GHOSTTY_LATEST_TAG" ]; then
+            AHEAD=$(gh api "repos/ghostty-org/ghostty/compare/$GHOSTTY_LATEST_TAG...$RESOLVED_SHA" --jq '.ahead_by' 2>/dev/null || echo "")
+            if [ "$AHEAD" = "0" ]; then
+              GHOSTTY_DESCRIBE="$GHOSTTY_LATEST_TAG"
+            elif [ -n "$AHEAD" ]; then
+              GHOSTTY_DESCRIBE="$GHOSTTY_LATEST_TAG-$AHEAD-g$GHOSTTY_SHORT_SHA"
+            else
+              GHOSTTY_DESCRIBE="g$GHOSTTY_SHORT_SHA"
+            fi
+          else
+            GHOSTTY_DESCRIBE="g$GHOSTTY_SHORT_SHA"
+          fi
+          echo "[*] ghostty describe: $GHOSTTY_DESCRIBE"
+
           if [ -n "$INPUT_RELEASE_TAG" ]; then
             if ! echo "$INPUT_RELEASE_TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
               echo "[!] release_tag must be a semantic version like 1.2.0: $INPUT_RELEASE_TAG"
@@ -113,6 +137,7 @@ jobs:
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "storage_release_tag=$STORAGE_RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "do_release=$DO_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "ghostty_describe=$GHOSTTY_DESCRIBE" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -329,9 +354,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.storage_release_tag }}
+          name: "${{ needs.prepare.outputs.storage_release_tag }} · ghostty ${{ needs.prepare.outputs.ghostty_describe }}"
           body: |
             GhosttyKit XCFramework
 
+            Built from ghostty: ${{ needs.prepare.outputs.ghostty_describe }}
             Built from ghostty ref: ${{ needs.prepare.outputs.build_ref }}
             Built from ghostty sha: ${{ needs.prepare.outputs.resolved_sha }}
           draft: false
@@ -344,9 +371,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: "${{ needs.prepare.outputs.release_tag }} · ghostty ${{ needs.prepare.outputs.ghostty_describe }}"
           body: |
             GhosttyKit ${{ needs.prepare.outputs.release_tag }}
 
+            Built from ghostty: ${{ needs.prepare.outputs.ghostty_describe }}
             Built from ghostty ref: ${{ needs.prepare.outputs.build_ref }}
             Built from ghostty sha: ${{ needs.prepare.outputs.resolved_sha }}
           draft: false
