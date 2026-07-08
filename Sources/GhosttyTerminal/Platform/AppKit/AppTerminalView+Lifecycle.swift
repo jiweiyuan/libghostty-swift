@@ -175,17 +175,38 @@
             core.requestImmediateTick()
         }
 
-        /// Re-fit on the next runloop turn, once the host layout has settled,
-        /// coalescing repeat requests from a single animation into one catch-up.
+        /// Re-fit after the host layout settles. Fires twice, mirroring Muxy's
+        /// resize hardening (`GhosttyTerminalNSView.updateMetalLayerSize`): once
+        /// on the next runloop turn — covers a normal grow whose final frame
+        /// lands immediately after this pass — and once ~120ms later, which
+        /// covers an *animated* settle (sidebar toggle, fullscreen, window zoom)
+        /// whose final frame arrives mid-animation and would otherwise leave the
+        /// grid boxed at the stale width. Each leg is coalesced independently so
+        /// a burst of layout passes schedules a single catch-up per leg.
         private func scheduleSettleResync() {
-            guard !settleResyncScheduled else { return }
-            settleResyncScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                settleResyncScheduled = false
-                core.fitToSize()
-                core.requestImmediateTick()
+            if !settleResyncScheduled {
+                settleResyncScheduled = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    settleResyncScheduled = false
+                    resyncAfterLayoutSettle()
+                }
             }
+            settleResyncLateWorkItem?.cancel()
+            let late = DispatchWorkItem { [weak self] in self?.resyncAfterLayoutSettle() }
+            settleResyncLateWorkItem = late
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: late)
+        }
+
+        /// Flush any pending layout so the view's `bounds` are the settled size —
+        /// the way Muxy calls `layoutSubtreeIfNeeded()` before reading its backing
+        /// size — then re-derive the grid metrics and paint. This runs off the
+        /// layout pass (a later runloop turn), so forcing layout here is safe and
+        /// guarantees `viewSize()` never measures a half-applied intermediate frame.
+        private func resyncAfterLayoutSettle() {
+            layoutSubtreeIfNeeded()
+            core.fitToSize()
+            core.requestImmediateTick()
         }
 
         override open func viewDidChangeBackingProperties() {

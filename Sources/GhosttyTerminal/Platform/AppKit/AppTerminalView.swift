@@ -19,9 +19,14 @@
         var lastPointerSelectionRect: CGRect?
         var pendingSelectionMenuPoint: CGPoint?
         var onFocusChange: ((Bool) -> Void)?
-        /// Coalesces the deferred re-sync scheduled from `layout()`. See
-        /// `scheduleSettleResync` in `AppTerminalView+Lifecycle`.
+        /// Coalesces the next-runloop deferred re-sync scheduled from `layout()`.
+        /// See `scheduleSettleResync` in `AppTerminalView+Lifecycle`.
         var settleResyncScheduled = false
+        /// Cancelable late catch-up re-sync for *animated* / programmatic settles
+        /// (sidebar toggle, fullscreen, window zoom) whose final frame lands after
+        /// the next runloop turn. Coalesced: only the last request in a burst
+        /// survives. Mirrors Muxy's deferred double-tap resize hardening.
+        var settleResyncLateWorkItem: DispatchWorkItem?
 
         open weak var delegate: (any TerminalSurfaceViewDelegate)? {
             get { core.delegate }
