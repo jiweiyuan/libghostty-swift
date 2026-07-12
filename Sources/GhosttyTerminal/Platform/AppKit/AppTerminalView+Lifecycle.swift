@@ -222,7 +222,7 @@
 
         func updateMetalLayerMetrics() {
             guard bounds.width > 0, bounds.height > 0 else { return }
-            let scale = core.scaleFactor()
+            let scale = core.sanitizedScaleFactor()
             // Write to the actually-attached backing layer (not just the
             // cached `metalLayer` ivar). The render pipeline can swap
             // `self.layer` to an IOSurfaceLayer for IOSurface-backed
@@ -249,7 +249,7 @@
         }
 
         func enforceMetalLayerScale() {
-            let scale = core.scaleFactor()
+            let scale = core.sanitizedScaleFactor()
             if let layer, layer.contentsScale != scale {
                 layer.contentsScale = scale
             }

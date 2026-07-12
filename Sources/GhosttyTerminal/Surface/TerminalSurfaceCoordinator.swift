@@ -83,6 +83,18 @@ final class TerminalSurfaceCoordinator {
     private var pendingImmediateTick = true
     private var lastTickTimestamp: TimeInterval = 0
     private var tickScheduled = false
+    private var lastCreateFailureAt: TimeInterval?
+
+    /// Cooldown before `fitToSize` may retry a surface create after
+    /// `ghostty_surface_new` failed. A full create is expensive (font grid,
+    /// Metal pipeline, compiled link regexes) and a failure can be *persistent*
+    /// — with the display asleep every attempt fails identically
+    /// (`error.OutOfMemory`), and each failed attempt strands a few KB inside
+    /// ghostty's error path. Without this, the layout/settle-resync cadence
+    /// retried at ~200/s and leaked ~1 GB/min for as long as the display
+    /// stayed dark. Deliberate triggers (controller/configuration change,
+    /// window attach) bypass the cooldown via `rebuildIfReady` directly.
+    private static let createRetryCooldown: TimeInterval = 2.0
 
     init() {
         bridge.onCellSizeChange = { [weak self] width, height in
@@ -127,7 +139,7 @@ final class TerminalSurfaceCoordinator {
             return
         }
 
-        let scale = scaleFactor()
+        let scale = sanitizedScaleFactor()
         TerminalDebugLog.log(
             .lifecycle,
             "surface rebuild scale=\(String(format: "%.2f", scale)) \(configuration.debugSummary)"
@@ -141,10 +153,12 @@ final class TerminalSurfaceCoordinator {
             }
         )
         guard let rawSurface else {
+            lastCreateFailureAt = Self.monotonicTimestamp()
             TerminalDebugLog.log(.lifecycle, "surface rebuild failed")
             return
         }
 
+        lastCreateFailureAt = nil
         bridge.rawSurface = rawSurface
         let newSurface = TerminalSurface(rawSurface)
         surface = newSurface
@@ -170,7 +184,7 @@ final class TerminalSurfaceCoordinator {
             return
         }
 
-        let scale = scaleFactor()
+        let scale = sanitizedScaleFactor()
         let size = viewSize()
         guard size.width > 0, size.height > 0 else {
             TerminalDebugLog.log(
@@ -232,6 +246,7 @@ final class TerminalSurfaceCoordinator {
 
     func fitToSize() {
         if surface == nil {
+            guard canRetryCreate else { return }
             rebuildIfReady()
         } else {
             synchronizeMetrics()
@@ -239,6 +254,11 @@ final class TerminalSurfaceCoordinator {
         if surface != nil {
             requestImmediateTick()
         }
+    }
+
+    private var canRetryCreate: Bool {
+        guard let lastCreateFailureAt else { return true }
+        return Self.monotonicTimestamp() - lastCreateFailureAt >= Self.createRetryCooldown
     }
 
     func setDisplayVisible(_ visible: Bool) {
@@ -391,6 +411,19 @@ final class TerminalSurfaceCoordinator {
 
     private static func monotonicTimestamp() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
+    }
+
+    /// `scaleFactor()` guarded against degenerate values. While the display is
+    /// asleep AppKit can report a zero backing scale; fed into
+    /// `ghostty_surface_new` as `scale_factor` that becomes a 0 DPI → 0 cell
+    /// size, and libghostty (built ReleaseFast, no checked arithmetic) turns
+    /// the grid division into a garbage-huge allocation that fails with
+    /// `error.OutOfMemory`. Clamp to the Retina default instead — a wrong-but-
+    /// sane scale is corrected by the next `viewDidChangeBackingProperties`.
+    func sanitizedScaleFactor() -> Double {
+        let scale = scaleFactor()
+        guard scale.isFinite, scale > 0 else { return 2.0 }
+        return scale
     }
 
     private var effectiveSurfaceVisible: Bool {
