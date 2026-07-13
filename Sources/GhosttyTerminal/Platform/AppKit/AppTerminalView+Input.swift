@@ -8,8 +8,22 @@
 #if canImport(AppKit) && !canImport(UIKit)
     import AppKit
     import GhosttyKit
+    import UniformTypeIdentifiers
 
     extension AppTerminalView {
+        /// Whether the general pasteboard holds an image with no text form
+        /// (e.g. a fresh screenshot). `paste_from_clipboard` can only write
+        /// text into the pty, so such a paste must instead reach the running
+        /// TUI as a Ctrl+V keystroke — agents like Claude Code respond to it
+        /// by reading the image straight off the system clipboard.
+        private var pasteboardHoldsImageOnly: Bool {
+            let pasteboard = NSPasteboard.general
+            guard pasteboard.string(forType: .string) == nil else { return false }
+            return pasteboard.canReadItem(
+                withDataConformingToTypes: [UTType.image.identifier]
+            )
+        }
+
         override open func keyDown(with event: NSEvent) {
             inputHandler?.handleKeyDown(with: event)
         }
@@ -18,6 +32,18 @@
             guard event.type == .keyDown else { return false }
             guard window?.firstResponder === self else { return false }
             guard let surface else { return false }
+
+            // Cmd+V with an image-only clipboard: ghostty's `super+v` binding
+            // would consume the key and paste nothing (no text to write).
+            // Hand the paste to the TUI as Ctrl+V before the binding eats it.
+            if event.charactersIgnoringModifiers == "v",
+               event.modifierFlags.contains(.command),
+               event.modifierFlags.isDisjoint(with: [.shift, .option, .control]),
+               pasteboardHoldsImageOnly
+            {
+                surface.sendText("\u{16}")
+                return true
+            }
 
             if keyIsBinding(event, on: surface) {
                 keyDown(with: event)
@@ -110,6 +136,14 @@
         }
 
         @IBAction func paste(_: Any?) {
+            if pasteboardHoldsImageOnly {
+                TerminalDebugLog.log(
+                    .input,
+                    "paste image-only clipboard, forwarding ctrl+v to tui"
+                )
+                surface?.sendText("\u{16}")
+                return
+            }
             if let text = NSPasteboard.general.string(forType: .string) {
                 TerminalDebugLog.log(
                     .input,
