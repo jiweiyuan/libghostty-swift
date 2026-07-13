@@ -67,6 +67,29 @@ public final class TerminalSurface {
         return pressed && released
     }
 
+    /// Submits a Ctrl+V press+release, exactly as if the user pressed it.
+    /// Ghostty's key encoder emits whatever the running program negotiated —
+    /// the legacy 0x16 byte or a kitty-protocol `CSI 118;5u` — so TUIs that
+    /// enable the kitty keyboard protocol (Claude Code does) still see their
+    /// image-paste key. Sending "\u{16}" through ``sendText(_:)`` would only
+    /// cover legacy mode. `keycode` is the native macOS virtual key for V
+    /// (`kVK_ANSI_V`, 0x09); the unshifted codepoint feeds the kitty encoding.
+    @discardableResult
+    public func submitCtrlV() -> Bool {
+        var event = ghostty_input_key_s()
+        event.mods = GHOSTTY_MODS_CTRL
+        event.consumed_mods = GHOSTTY_MODS_NONE
+        event.keycode = 0x09
+        event.text = nil
+        event.unshifted_codepoint = 0x76
+        event.composing = false
+        event.action = GHOSTTY_ACTION_PRESS
+        let pressed = sendKeyEvent(event)
+        event.action = GHOSTTY_ACTION_RELEASE
+        let released = sendKeyEvent(event)
+        return pressed && released
+    }
+
     @discardableResult
     public func sendText(_ text: String) -> Bool {
         guard let s = surface else {

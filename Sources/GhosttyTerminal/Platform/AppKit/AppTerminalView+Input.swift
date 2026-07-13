@@ -41,7 +41,7 @@
                event.modifierFlags.isDisjoint(with: [.shift, .option, .control]),
                pasteboardHoldsImageOnly
             {
-                surface.sendText("\u{16}")
+                surface.submitCtrlV()
                 return true
             }
 
@@ -141,7 +141,7 @@
                     .input,
                     "paste image-only clipboard, forwarding ctrl+v to tui"
                 )
-                surface?.sendText("\u{16}")
+                surface?.submitCtrlV()
                 return
             }
             if let text = NSPasteboard.general.string(forType: .string) {
