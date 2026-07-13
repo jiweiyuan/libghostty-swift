@@ -107,8 +107,17 @@
         }
 
         @objc func windowDidResignKey(_: Notification) {
+            // Key-window status and first-responder ownership are different axes.
+            // Dim the cursor to its unfocused (hollow) state via the core — but do
+            // NOT write "unfocused" back through the SwiftUI focus binding. The view
+            // is still first responder; only the window went non-key. Reporting a
+            // focus loss here clears the host's `@FocusState`, and if any host
+            // re-render then runs `synchronizeFocus` while the window is non-key, it
+            // strips first-responder status for real (`makeFirstResponder(nil)`) — so
+            // on reactivation the cursor stays hollow until the user clicks. Ghostty's
+            // own macOS app keeps window-key status as separate state for exactly this
+            // reason; we mirror that by leaving the binding untouched on key loss.
             core.setFocus(false)
-            onFocusChange?(false)
         }
 
         @objc func windowDidChangeScreen(_: Notification) {

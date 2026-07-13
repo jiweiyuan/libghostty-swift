@@ -52,7 +52,15 @@ struct TerminalViewRepresentable {
                     if window.firstResponder !== view {
                         window.makeFirstResponder(view)
                     }
-                } else if window.firstResponder === view {
+                } else if window.firstResponder === view, window.isKeyWindow {
+                    // Only surrender first-responder status when the window is key.
+                    // A re-render that lands while the window is non-key can carry a
+                    // transiently-cleared binding (the host's `@FocusState` momentarily
+                    // nil during a window/app switch); stripping the live first responder
+                    // then leaves the cursor hollow with no way back until the user
+                    // clicks. Deferring the surrender to key windows means a genuine
+                    // defocus (the app moved focus to another view while active) still
+                    // yields, but a mere key-loss flicker cannot destroy focus.
                     window.makeFirstResponder(nil)
                 }
             #endif
