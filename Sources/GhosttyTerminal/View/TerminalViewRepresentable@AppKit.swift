@@ -30,6 +30,7 @@
 
         static func dismantleNSView(_ view: TerminalView, coordinator _: ()) {
             view.onFocusChange = nil
+            view.teardownFocusSynchronization()
         }
     }
 #endif

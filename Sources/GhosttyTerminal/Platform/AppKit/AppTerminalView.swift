@@ -19,6 +19,13 @@
         var lastPointerSelectionRect: CGRect?
         var pendingSelectionMenuPoint: CGPoint?
         var onFocusChange: ((Bool) -> Void)?
+        /// The current SwiftUI focus intent. AppKit focus synchronization reads this
+        /// again when deferred work executes so stale render passes cannot move focus.
+        var focusBinding: TerminalFocusBinding?
+        /// Invalidates retry work created by an older focus request.
+        var focusMoveGeneration = 0
+        /// Invalidates a deferred resign report when focus returns before it settles.
+        var focusResignGeneration = 0
         /// Coalesces the next-runloop deferred re-sync scheduled from `layout()`.
         /// See `scheduleSettleResync` in `AppTerminalView+Lifecycle`.
         var settleResyncScheduled = false

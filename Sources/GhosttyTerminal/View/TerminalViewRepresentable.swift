@@ -36,35 +36,19 @@ struct TerminalViewRepresentable {
     }
 
     static func synchronizeFocus(_ view: TerminalView, with binding: TerminalFocusBinding?) {
-        guard let binding else { return }
-
-        DispatchQueue.main.async { [weak view] in
-            #if canImport(UIKit)
+        #if canImport(UIKit)
+            guard let binding else { return }
+            DispatchQueue.main.async { [weak view] in
                 guard let view, view.window != nil else { return }
                 if binding.isFocused {
                     if !view.isFirstResponder { view.becomeFirstResponder() }
                 } else if view.isFirstResponder {
                     _ = view.resignFirstResponder()
                 }
-            #elseif canImport(AppKit)
-                guard let view, let window = view.window else { return }
-                if binding.isFocused {
-                    if window.firstResponder !== view {
-                        window.makeFirstResponder(view)
-                    }
-                } else if window.firstResponder === view, window.isKeyWindow {
-                    // Only surrender first-responder status when the window is key.
-                    // A re-render that lands while the window is non-key can carry a
-                    // transiently-cleared binding (the host's `@FocusState` momentarily
-                    // nil during a window/app switch); stripping the live first responder
-                    // then leaves the cursor hollow with no way back until the user
-                    // clicks. Deferring the surrender to key windows means a genuine
-                    // defocus (the app moved focus to another view while active) still
-                    // yields, but a mere key-loss flicker cannot destroy focus.
-                    window.makeFirstResponder(nil)
-                }
-            #endif
-        }
+            }
+        #elseif canImport(AppKit)
+            view.synchronizeFocus(with: binding)
+        #endif
     }
 }
 
@@ -72,6 +56,14 @@ struct TerminalViewRepresentable {
 struct TerminalFocusBinding {
     private let read: () -> Bool
     private let write: (Bool) -> Void
+
+    init(
+        read: @escaping () -> Bool,
+        write: @escaping (Bool) -> Void
+    ) {
+        self.read = read
+        self.write = write
+    }
 
     var isFocused: Bool {
         read()
@@ -95,7 +87,13 @@ struct TerminalFocusBinding {
         TerminalFocusBinding(
             read: { binding.wrappedValue == value },
             write: { focused in
-                binding.wrappedValue = focused ? value : nil
+                if focused {
+                    binding.wrappedValue = value
+                } else if binding.wrappedValue == value {
+                    // A surface resigning after another enum case already became
+                    // focused must not clear the new surface's focus intent.
+                    binding.wrappedValue = nil
+                }
             }
         )
     }

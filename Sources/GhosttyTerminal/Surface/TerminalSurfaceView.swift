@@ -42,6 +42,13 @@ public struct TerminalSurfaceView: View {
         }
     }
 
+    /// Synchronizes this surface's first-responder intent with a Boolean focus
+    /// binding. On AppKit, acquisition is retried briefly if the surface has not
+    /// entered a window yet, and transient responder orphans are repaired without
+    /// stealing focus from another real control.
+    ///
+    /// Prefer one Boolean binding per mounted terminal surface. Window-key status
+    /// is tracked separately and does not clear this surface's focus intent.
     public func terminalFocused(
         _ condition: FocusState<Bool>.Binding
     ) -> TerminalSurfaceView {
@@ -51,6 +58,9 @@ public struct TerminalSurfaceView: View {
         )
     }
 
+    /// Synchronizes this surface with one case of an optional focus binding.
+    /// A late resign from this surface will not clear a different case that has
+    /// already become focused.
     public func terminalFocused<Value: Hashable>(
         _ binding: FocusState<Value?>.Binding,
         equals value: Value

@@ -37,15 +37,28 @@
 
         override open func becomeFirstResponder() -> Bool {
             let result = super.becomeFirstResponder()
-            core.setFocus(true)
-            onFocusChange?(true)
+            if result {
+                focusDidBecomeFirstResponder()
+                // First-responder ownership and key-window status are separate.
+                // Preserve the binding intent in a non-key window, but keep the
+                // Ghostty cursor visually inactive until didBecomeKey.
+                core.setFocus(window?.isKeyWindow == true)
+                onFocusChange?(true)
+            }
             return result
         }
 
         override open func resignFirstResponder() -> Bool {
+            let focusWindow = window
+            let wasIntended = focusBinding?.isFocused == true
             let result = super.resignFirstResponder()
-            core.setFocus(false)
-            onFocusChange?(false)
+            if result {
+                core.setFocus(false)
+                focusDidResignFirstResponder(
+                    from: focusWindow,
+                    wasIntended: wasIntended
+                )
+            }
             return result
         }
 
@@ -65,6 +78,9 @@
                 updateColorScheme()
                 core.startDisplayLink()
                 core.requestImmediateTick()
+                if focusBinding?.isFocused == true {
+                    requestFocusMove()
+                }
 
                 NotificationCenter.default.addObserver(
                     self,
@@ -103,7 +119,12 @@
             let focused = window?.isKeyWindow == true
                 && window?.firstResponder === self
             core.setFocus(focused)
-            onFocusChange?(focused)
+            if !focused,
+               focusBinding?.isFocused == true,
+               let window,
+               window.firstResponder == nil || window.firstResponder === window {
+                requestFocusMove()
+            }
         }
 
         @objc func windowDidResignKey(_: Notification) {
