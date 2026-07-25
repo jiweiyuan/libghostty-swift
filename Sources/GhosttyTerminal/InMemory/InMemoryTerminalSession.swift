@@ -11,6 +11,16 @@ import GhosttyKit
 public final class InMemoryTerminalSession: @unchecked Sendable {
     private let lock = NSLock()
     private var surface: ghostty_surface_t?
+    /// Host output received before a surface has attached. The read pump is
+    /// armed the instant the child is spawned, but the ghostty surface is not
+    /// built until the view mounts a turn later — so the shell's first prompt
+    /// can arrive before `setSurface`. Buffer it here instead of dropping it,
+    /// and flush it the moment a surface attaches (see `setSurface`).
+    private var pendingPreSurface = Data()
+    /// Safety cap on the pre-surface buffer so a surface that never attaches
+    /// cannot grow it without bound. A cold-start prompt is a few hundred
+    /// bytes; this only bites pathological cases. Oldest bytes drop first.
+    private static let pendingPreSurfaceCap = 1 << 20 // 1 MB
     private var lastResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
@@ -29,6 +39,23 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         self.surface = surface
+        // Flush anything the host sent before the surface existed — the shell's
+        // first prompt at cold start. Runs under the same lock as `receive`, so
+        // these buffered bytes are written strictly before any live byte that
+        // arrives after attach: order is preserved and nothing double-renders.
+        if let surface, !pendingPreSurface.isEmpty {
+            pendingPreSurface.withUnsafeBytes { buffer in
+                guard let ptr = buffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
+                }
+                ghostty_surface_write_buffer(surface, ptr, UInt(buffer.count))
+            }
+            TerminalDebugLog.log(
+                .output,
+                "terminal <- host flushed pre-surface \(pendingPreSurface.count) bytes"
+            )
+            pendingPreSurface.removeAll(keepingCapacity: false)
+        }
         TerminalDebugLog.log(
             .lifecycle,
             "in-memory session surface=\(surface == nil ? "nil" : "set")"
@@ -127,9 +154,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let surface else {
+            // No surface yet — buffer instead of dropping so the shell's first
+            // prompt survives the spawn→attach race. Flushed in `setSurface`.
+            pendingPreSurface.append(data)
+            if pendingPreSurface.count > Self.pendingPreSurfaceCap {
+                pendingPreSurface.removeFirst(pendingPreSurface.count - Self.pendingPreSurfaceCap)
+            }
             TerminalDebugLog.log(
                 .output,
-                "terminal <- host dropped \(TerminalDebugLog.describe(data))"
+                "terminal <- host buffered pre-surface \(TerminalDebugLog.describe(data))"
             )
             return
         }
