@@ -60,7 +60,9 @@ final class TerminalSurfaceCoordinator {
     /// `UITerminalView.detachOrphanedSurfaceLayers`.
     var onSurfaceLayersOrphaned: (() -> Void)?
 
-    /// Called after every display-link render (`tick`).
+    /// Called at the end of every coordinator `tick`, after the render
+    /// *request* — the actual presentation happens asynchronously on
+    /// ghostty's renderer thread.
     ///
     /// When `synchronizeMetrics` sends a new pixel size to ghostty via
     /// `setSize`, the underlying IOSurface is not rebuilt synchronously.
@@ -77,6 +79,19 @@ final class TerminalSurfaceCoordinator {
     var onPostRender: (() -> Void)?
 
     private var lastMetrics: TerminalViewportMetrics?
+
+    /// The last `(scale, pixel size)` sent to ghostty. Layout passes and
+    /// settle resyncs re-run `synchronizeMetrics` far more often than the
+    /// size changes, and ghostty ignores same-size resizes internally —
+    /// skipping the send saves the Swift→C round-trips and keeps a `setSize`
+    /// debug line meaning a real resize.
+    private struct SentSurfaceSize: Equatable {
+        var scale: Double
+        var pixelWidth: UInt32
+        var pixelHeight: UInt32
+    }
+
+    private var lastSentSize: SentSurfaceSize?
     private var isDisplayVisible = true
     private var isApplicationActive = true
     private var isSurfaceFocused = false
@@ -204,13 +219,22 @@ final class TerminalSurfaceCoordinator {
             return
         }
 
-        TerminalDebugLog.log(
-            .metrics,
-            "sync view=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height)) scale=\(String(format: "%.2f", scale)) pixels=\(pixelWidth)x\(pixelHeight)"
+        let sentSize = SentSurfaceSize(
+            scale: scale,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
         )
-
-        surface.setContentScale(x: scale, y: scale)
-        surface.setSize(width: pixelWidth, height: pixelHeight)
+        if sentSize != lastSentSize {
+            TerminalDebugLog.log(
+                .metrics,
+                "sync view=\(String(format: "%.2f", size.width))x\(String(format: "%.2f", size.height)) scale=\(String(format: "%.2f", scale)) pixels=\(pixelWidth)x\(pixelHeight)"
+            )
+            // Record before sending — setSize can re-enter synchronizeMetrics
+            // via a synchronous cell-size callback.
+            lastSentSize = sentSize
+            surface.setContentScale(x: scale, y: scale)
+            surface.setSize(width: pixelWidth, height: pixelHeight)
+        }
 
         guard let surfaceSize = surface.size(),
               surfaceSize.columns > 0, surfaceSize.rows > 0
@@ -308,8 +332,14 @@ final class TerminalSurfaceCoordinator {
         lastTickTimestamp = context.timestamp
         TerminalDebugLog.log(.render, "tick")
         controller?.tick()
+        // Never pair this with `surface.draw()`: draw presents inline on the
+        // main thread while renderer-thread frames present via blocks queued
+        // to the main runloop, and ghostty discards only wrong-*sized* stale
+        // frames — an already-queued older frame could land after the newer
+        // inline one, briefly rolling part of the pane's content backwards
+        // around output bursts. Resize repaints stay synchronous inside
+        // ghostty via the layer's `needsDisplayOnBoundsChange` callback.
         surface?.refresh()
-        surface?.draw()
         onPostRender?()
     }
 
@@ -359,6 +389,7 @@ final class TerminalSurfaceCoordinator {
             onSurfaceLayersOrphaned?()
         }
         lastMetrics = nil
+        lastSentSize = nil
         pendingImmediateTick = true
         lastTickTimestamp = 0
         controller?.remove(bridge)
