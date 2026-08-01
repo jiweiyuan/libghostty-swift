@@ -288,6 +288,21 @@
             }
         }
 
+        /// macOS counterpart of `UITerminalView.detachOrphanedSurfaceLayers`,
+        /// run on every surface teardown via `onSurfaceLayersOrphaned`. On
+        /// macOS ghostty installs its renderer by *replacing* the backing
+        /// layer with an IOSurfaceLayer (sublayers are the iOS shape), and
+        /// `ghostty_surface_free` leaves that layer attached, frozen on its
+        /// last frame. Restoring the view's own CAMetalLayer detaches the
+        /// orphan; sublayers are left alone — any here belong to consumers.
+        func detachOrphanedSurfaceLayers() {
+            if let metalLayer, let layer, layer !== metalLayer {
+                layer.delegate = nil
+                self.layer = metalLayer
+                updateMetalLayerMetrics()
+            }
+        }
+
         override open func viewDidChangeEffectiveAppearance() {
             super.viewDidChangeEffectiveAppearance()
             updateColorScheme()

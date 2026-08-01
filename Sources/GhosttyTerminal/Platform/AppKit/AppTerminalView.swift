@@ -111,6 +111,9 @@
             core.onPostRender = { [weak self] in
                 self?.enforceMetalLayerScale()
             }
+            core.onSurfaceLayersOrphaned = { [weak self] in
+                self?.detachOrphanedSurfaceLayers()
+            }
         }
 
         open func selectionMenuPoint(at point: CGPoint) -> CGPoint? {
