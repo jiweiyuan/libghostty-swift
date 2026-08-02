@@ -43,6 +43,10 @@
             var softwareKeyboardVisible = false
             var pendingKeyboardDismissOnTouchEnd = false
             var touchDidScrollDuringCurrentTouch = false
+            /// A long-press touch selection is in flight (shifted mouse drag
+            /// into the core). While set, the touch-scroll pan must not begin
+            /// — the finger is extending a selection, not scrolling.
+            var touchSelectionActive = false
         #endif
 
         #if !targetEnvironment(macCatalyst)

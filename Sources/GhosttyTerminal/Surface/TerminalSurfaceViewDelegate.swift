@@ -149,6 +149,24 @@ public protocol TerminalSurfaceTextSelectionRequestDelegate: TerminalSurfaceView
     func terminalDidRequestTextSelection(_ request: TerminalTextSelectionRequest)
 }
 
+/// In-place touch selection, driven through the core's shift-override mouse
+/// path: the long-press synthesizes a shifted double-click (word under the
+/// finger), the drag extends it word-wise, and the release hands the host
+/// this callback to put an edit menu over the live, natively-rendered
+/// selection. Shift is the xterm/kitty override ghostty honors even while a
+/// TUI captures the mouse, so the same gesture works under mouse-reporting
+/// apps (Claude Code's fullscreen mode) and plain shells alike.
+///
+/// Adopting this protocol arms the UIKit long-press recognizer and takes
+/// precedence over the legacy snapshot-page delegate.
+@MainActor
+public protocol TerminalSurfaceTouchSelectionDelegate: TerminalSurfaceViewDelegate {
+    /// The touch-selection gesture ended. `hasSelection` is the core's
+    /// selection state at release; `point` is the release location in the
+    /// view's coordinate space — anchor the edit menu there.
+    func terminalTouchSelectionEnded(hasSelection: Bool, at point: CGPoint)
+}
+
 /// Notifies a delegate when the underlying ``TerminalSurface`` is created or
 /// torn down. Useful when a consumer needs surface-level APIs (e.g.
 /// ``TerminalSurface/sendText(_:)``) reachable from outside the platform view.

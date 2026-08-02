@@ -451,6 +451,12 @@
             @objc func handleLongPressForSelection(
                 _ gesture: UILongPressGestureRecognizer
             ) {
+                // In-place selection supersedes the snapshot page when the
+                // host adopts it; legacy adopters keep the old flow below.
+                if (delegate as? any TerminalSurfaceTouchSelectionDelegate) != nil {
+                    handleTouchSelectionGesture(gesture)
+                    return
+                }
                 guard gesture.state == .began else { return }
                 guard let delegate = delegate as? any TerminalSurfaceTextSelectionRequestDelegate else { return }
                 guard let surface else { return }
@@ -508,6 +514,68 @@
                     anchorRange: anchorRange,
                     sourcePoint: viewPoint
                 ))
+            }
+
+            /// In-place touch selection: the finger drives the core's own
+            /// selection through shift-modified mouse events. Shift is the
+            /// xterm/kitty mouse-capture override ghostty honors (Surface.zig
+            /// skips the mouse report and falls through to selection when
+            /// shift is down and `mouse-shift-capture` permits), so the same
+            /// gesture selects locally under a mouse-reporting TUI (Claude
+            /// Code fullscreen) and a plain shell alike. The selection is
+            /// rendered by ghostty itself — theme-correct, extendable into
+            /// scrollback via the core's edge autoscroll.
+            func handleTouchSelectionGesture(_ gesture: UILongPressGestureRecognizer) {
+                guard let surface else { return }
+                let point = gesture.location(in: self)
+                let mods = GHOSTTY_MODS_SHIFT
+                switch gesture.state {
+                case .began:
+                    stopMomentumScrolling()
+                    core.setFocus(true)
+                    touchSelectionActive = true
+                    // Word under the finger, like iOS text views: a shifted
+                    // double-click (press–release–press inside the core's
+                    // click interval) lands in word-select mode, and keeping
+                    // the second press held makes the ensuing drag extend
+                    // word-wise.
+                    surface.sendMousePos(x: Double(point.x), y: Double(point.y), mods: mods)
+                    surface.sendMouseButton(
+                        state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_LEFT, mods: mods
+                    )
+                    surface.sendMouseButton(
+                        state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_LEFT, mods: mods
+                    )
+                    surface.sendMouseButton(
+                        state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_LEFT, mods: mods
+                    )
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                    TerminalDebugLog.log(
+                        .input,
+                        "touch selection began point=\(NSCoder.string(for: point))"
+                    )
+                case .changed:
+                    guard touchSelectionActive else { return }
+                    surface.sendMousePos(x: Double(point.x), y: Double(point.y), mods: mods)
+                case .ended, .cancelled, .failed:
+                    guard touchSelectionActive else { return }
+                    touchSelectionActive = false
+                    surface.sendMousePos(x: Double(point.x), y: Double(point.y), mods: mods)
+                    surface.sendMouseButton(
+                        state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_LEFT, mods: mods
+                    )
+                    let hasSelection = surface.hasSelection()
+                    TerminalDebugLog.log(
+                        .input,
+                        "touch selection ended state=\(gesture.state.rawValue) hasSelection=\(hasSelection)"
+                    )
+                    guard gesture.state == .ended,
+                          let delegate = delegate as? any TerminalSurfaceTouchSelectionDelegate
+                    else { return }
+                    delegate.terminalTouchSelectionEnded(hasSelection: hasSelection, at: point)
+                default:
+                    break
+                }
             }
         #endif
 
@@ -629,8 +697,17 @@
             _ gestureRecognizer: UIGestureRecognizer
         ) -> Bool {
             if gestureRecognizer is UILongPressGestureRecognizer {
-                return (delegate as? any TerminalSurfaceTextSelectionRequestDelegate) != nil
+                return (delegate as? any TerminalSurfaceTouchSelectionDelegate) != nil
+                    || (delegate as? any TerminalSurfaceTextSelectionRequestDelegate) != nil
             }
+            #if !targetEnvironment(macCatalyst)
+                // Mid-selection the finger is extending, not scrolling: the
+                // touch-scroll pan would otherwise begin the moment the drag
+                // passes its slop and fight the selection for the touch.
+                if gestureRecognizer is UIPanGestureRecognizer, touchSelectionActive {
+                    return false
+                }
+            #endif
             return true
         }
 
