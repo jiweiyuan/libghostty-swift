@@ -27,5 +27,15 @@
         public func terminalSelectedText() -> String? {
             surface?.readSelection()
         }
+
+        /// True when the most recent touch sequence became a touch selection
+        /// (the long-press gesture began), until the next touch lands. Hosts
+        /// that summon the keyboard from their own `touchesEnded` override
+        /// must skip sequences where this is set — a selection is not a tap,
+        /// and the keyboard sliding up would dismiss the edit menu the
+        /// selection just presented.
+        public var touchSequenceWasSelection: Bool {
+            touchSelectionOwnedCurrentTouch
+        }
     }
 #endif

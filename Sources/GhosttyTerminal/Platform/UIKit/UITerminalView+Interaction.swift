@@ -67,7 +67,10 @@
                 pendingKeyboardDismissOnTouchEnd = false
                 pendingKeyboardSummonOnTouchEnd = false
                 touchDidScrollDuringCurrentTouch = false
-                touchSelectionOwnedCurrentTouch = false
+                // touchSelectionOwnedCurrentTouch deliberately survives until
+                // the next touchesBegan — hosts read it (as
+                // `touchSequenceWasSelection`) from their own touchesEnded,
+                // which runs after this one.
             #endif
             super.touchesEnded(touches, with: event)
         }
@@ -83,7 +86,8 @@
                 pendingKeyboardDismissOnTouchEnd = false
                 pendingKeyboardSummonOnTouchEnd = false
                 touchDidScrollDuringCurrentTouch = false
-                touchSelectionOwnedCurrentTouch = false
+                // touchSelectionOwnedCurrentTouch survives to the next
+                // touchesBegan (see touchesEnded).
             #endif
             super.touchesCancelled(touches, with: event)
         }

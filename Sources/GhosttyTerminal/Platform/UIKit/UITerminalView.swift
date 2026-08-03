@@ -51,7 +51,9 @@
             /// it must neither summon nor dismiss the keyboard on lift.
             /// Distinct from `touchSelectionActive`, which can clear before
             /// `touchesEnded` runs (gesture callbacks race UIKit's touch
-            /// delivery).
+            /// delivery). Reset on the NEXT `touchesBegan`, not on lift, so
+            /// hosts with their own keyboard policy can read it from their
+            /// `touchesEnded` override via `touchSequenceWasSelection`.
             var touchSelectionOwnedCurrentTouch = false
             /// Keyboard-hidden touch: summon happens on lift, not on landing
             /// — a landing that turns into a scroll or a selection must not
