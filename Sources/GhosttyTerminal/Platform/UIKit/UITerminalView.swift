@@ -47,6 +47,16 @@
             /// into the core). While set, the touch-scroll pan must not begin
             /// — the finger is extending a selection, not scrolling.
             var touchSelectionActive = false
+            /// The current touch sequence became a selection at some point —
+            /// it must neither summon nor dismiss the keyboard on lift.
+            /// Distinct from `touchSelectionActive`, which can clear before
+            /// `touchesEnded` runs (gesture callbacks race UIKit's touch
+            /// delivery).
+            var touchSelectionOwnedCurrentTouch = false
+            /// Keyboard-hidden touch: summon happens on lift, not on landing
+            /// — a landing that turns into a scroll or a selection must not
+            /// slide the keyboard up mid-gesture.
+            var pendingKeyboardSummonOnTouchEnd = false
         #endif
 
         #if !targetEnvironment(macCatalyst)
@@ -217,6 +227,12 @@
                 return false
             }
             UIPasteboard.general.string = text
+            // Also run the core's own copy: with `selection-clear-on-copy`
+            // (the iOS platform default) it dissolves the selection, ending
+            // the gesture the way iOS text views do. The action's clipboard
+            // write lands on UIPasteboard too (same callback) — a harmless
+            // duplicate of the line above, which stays for determinism.
+            surface?.performBindingAction("copy_to_clipboard")
             #if DEBUG
                 if ProcessInfo.processInfo.arguments.contains("--ui-testing") {
                     accessibilityValue = text

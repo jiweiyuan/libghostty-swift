@@ -15,6 +15,16 @@ enum GhosttyConfigRenderer {
     ) -> String {
         var sections: [String] = []
 
+        // Platform defaults lead so explicit app/user config overrides them.
+        // iOS: copy is menu-driven (touch selection → edit menu), and clearing
+        // on copy is what ends that gesture — a selection left behind makes
+        // the next shifted press extend it instead of fresh-selecting
+        // (Surface.zig's shift-click semantics). macOS keeps ghostty's
+        // default (selection survives ⌘C), matching desktop terminals.
+        #if os(iOS) && !targetEnvironment(macCatalyst)
+            sections.append("selection-clear-on-copy = true")
+        #endif
+
         let normalizedBase = normalize(baseContents)
         if !normalizedBase.isEmpty {
             sections.append(normalizedBase)

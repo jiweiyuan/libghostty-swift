@@ -22,11 +22,17 @@
                 becomeFirstResponder()
             #else
                 pendingKeyboardDismissOnTouchEnd = false
+                pendingKeyboardSummonOnTouchEnd = false
                 touchDidScrollDuringCurrentTouch = false
+                touchSelectionOwnedCurrentTouch = false
                 if softwareKeyboardVisible {
                     pendingKeyboardDismissOnTouchEnd = true
                 } else {
-                    becomeFirstResponder()
+                    // Summon on lift, not on landing: a landing that becomes
+                    // a scroll or a long-press selection must not slide the
+                    // keyboard up mid-gesture (buttons act on release; so
+                    // does tap-to-type).
+                    pendingKeyboardSummonOnTouchEnd = true
                 }
             #endif
         }
@@ -49,11 +55,19 @@
                 return
             }
             #if !targetEnvironment(macCatalyst)
-                if pendingKeyboardDismissOnTouchEnd, !touchDidScrollDuringCurrentTouch {
-                    resignFirstResponder()
+                // A touch that scrolled or selected is not a tap: it leaves
+                // the keyboard exactly as it found it.
+                if !touchDidScrollDuringCurrentTouch, !touchSelectionOwnedCurrentTouch {
+                    if pendingKeyboardDismissOnTouchEnd {
+                        resignFirstResponder()
+                    } else if pendingKeyboardSummonOnTouchEnd {
+                        becomeFirstResponder()
+                    }
                 }
                 pendingKeyboardDismissOnTouchEnd = false
+                pendingKeyboardSummonOnTouchEnd = false
                 touchDidScrollDuringCurrentTouch = false
+                touchSelectionOwnedCurrentTouch = false
             #endif
             super.touchesEnded(touches, with: event)
         }
@@ -67,7 +81,9 @@
             }
             #if !targetEnvironment(macCatalyst)
                 pendingKeyboardDismissOnTouchEnd = false
+                pendingKeyboardSummonOnTouchEnd = false
                 touchDidScrollDuringCurrentTouch = false
+                touchSelectionOwnedCurrentTouch = false
             #endif
             super.touchesCancelled(touches, with: event)
         }
@@ -356,7 +372,9 @@
                     target: self,
                     action: #selector(handleLongPressForSelection(_:))
                 )
-                longPress.minimumPressDuration = 0.5
+                // 0.3s, not the UIKit 0.5 default: matches the feel of text
+                // selection in the system's own views — 0.5 reads as "stuck".
+                longPress.minimumPressDuration = 0.3
                 longPress.allowableMovement = 10
                 longPress.numberOfTouchesRequired = 1
                 longPress.numberOfTapsRequired = 0
@@ -534,6 +552,9 @@
                     stopMomentumScrolling()
                     core.setFocus(true)
                     touchSelectionActive = true
+                    // This touch is a selection now — `touchesEnded` must
+                    // leave the keyboard alone (neither summon nor dismiss).
+                    touchSelectionOwnedCurrentTouch = true
                     // Word under the finger, like iOS text views: a shifted
                     // double-click (press–release–press inside the core's
                     // click interval) lands in word-select mode, and keeping
