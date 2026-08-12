@@ -88,11 +88,6 @@ case "$PLATFORM_GROUP" in
             "aarch64-ios-simulator@apple_a17" \
             "x86_64-ios-simulator"
         ;;
-    maccatalyst)
-        build_variant "maccatalyst" \
-            "aarch64-ios-macabi@apple_a17" \
-            "x86_64-ios-macabi"
-        ;;
     tvos)
         build_variant "appletvos" \
             "aarch64-tvos"

@@ -38,7 +38,6 @@ let package = Package(
     platforms: [
         .iOS(.v15),
         .macOS(.v13),
-        .macCatalyst(.v15),
     ],
     products: [
         .library(name: "Consumer", targets: ["Consumer"]),
@@ -88,7 +87,6 @@ test_build() {
 (
     cd "$WORK_DIR/Consumer"
     test_build "generic/platform=macOS"
-    test_build "generic/platform=macOS,variant=Mac Catalyst"
     test_build "generic/platform=iOS"
     test_build "generic/platform=iOS Simulator"
 )
