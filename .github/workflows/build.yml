@@ -202,11 +202,12 @@ jobs:
             cpu: apple_a17
           - target: x86_64-ios-simulator
             variant: iphonesimulator
-          - target: aarch64-ios-macabi
-            variant: maccatalyst
-            cpu: apple_a17
-          - target: x86_64-ios-macabi
-            variant: maccatalyst
+          # Mac Catalyst is dropped: zig 0.16 removed `macabi` from its ABI
+          # enum entirely, so `*-ios-macabi` no longer parses as a target, and
+          # ghostty main requires zig 0.16. Nothing consuming this package
+          # builds for Catalyst — termio is macOS-only plus a UIKit iOS app
+          # with SUPPORTS_MACCATALYST unset. Restore these two entries if zig
+          # brings the ABI back.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
