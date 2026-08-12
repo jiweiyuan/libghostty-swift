@@ -60,6 +60,41 @@ apply_unified_patch() {
     echo "[+] applied patch: $(basename "$patch_file")"
 }
 
+# Series-level stamp.
+#
+# Per-patch reverse detection cannot answer "is this series already applied?"
+# once patches overlap: 0002, 0004 and 0007 all edit src/apprt/embedded.zig, so
+# reverse-applying 0002 alone no longer matches after the later two have run.
+# `build-ghostty.sh` re-runs this script once per target against one source
+# tree, which made every multi-target local build fail on the second target.
+# CI never saw it because each target is a separate job with a fresh clone.
+#
+# So stamp the tree with a digest of the patch set. An identical set is a
+# no-op; a changed set is a hard error, because this script cannot layer a
+# new series on top of an already-patched tree.
+STAMP_FILE="$SOURCE_DIR/.libghostty-patches-applied"
+PATCH_SET_DIGEST="$(
+    find "$PATCH_DIR" -type f ! -name '*.md' -print0 |
+        sort -z |
+        xargs -0 shasum -a 256 |
+        awk '{print $1}' |
+        shasum -a 256 |
+        awk '{print $1}'
+)"
+
+if [ -f "$STAMP_FILE" ]; then
+    PREVIOUS="$(cat "$STAMP_FILE")"
+    if [ "$PREVIOUS" = "$PATCH_SET_DIGEST" ]; then
+        echo "[+] patch series already applied (${PATCH_SET_DIGEST:0:12})"
+        exit 0
+    fi
+    echo "[-] source tree carries a different patch series"
+    echo "    applied: ${PREVIOUS:0:12}"
+    echo "    wanted:  ${PATCH_SET_DIGEST:0:12}"
+    echo "    start from a clean ghostty checkout"
+    exit 1
+fi
+
 for patch_file in "$PATCH_DIR"/*; do
     [ -e "$patch_file" ] || continue
 
@@ -77,3 +112,6 @@ for patch_file in "$PATCH_DIR"/*; do
             ;;
     esac
 done
+
+# Only stamp once every patch in the series has succeeded.
+printf '%s\n' "$PATCH_SET_DIGEST" > "$STAMP_FILE"

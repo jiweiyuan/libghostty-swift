@@ -19,19 +19,54 @@ from pathlib import Path
 source_dir = Path(sys.argv[1])
 marker = sys.argv[2]
 
+
+class PatchError(Exception):
+    pass
+
+
+def load(rel):
+    """Read a file that must exist. A missing file is a hard error, never a skip."""
+    path = source_dir / rel
+    if not path.is_file():
+        raise PatchError(f"missing file: {rel}")
+    return path, path.read_text()
+
+
+def replace_exact(text, old, new, what, expected=1):
+    """Replace with an exact match count.
+
+    Both zero matches (upstream renamed the anchor) and more matches than
+    expected (upstream grew a second call site) are errors. A silent no-op
+    here previously emitted syntactically invalid Zig with a zero exit code,
+    which CI then tried to compile.
+    """
+    found = text.count(old)
+    if found != expected:
+        raise PatchError(
+            f"{what}: expected {expected} match(es), found {found}"
+        )
+    return text.replace(old, new)
+
+
+# Every transformation runs against in-memory copies first. Nothing is written
+# until all of them succeed, so a later failure can never leave a half-patched
+# tree behind the already-installed marker.
+config_path, config = load("src/build/Config.zig")
+shared_path, shared = load("src/build/SharedDeps.zig")
+bc_path, bc = load("src/build_config.zig")
+global_path, glob = load("src/global.zig")
+shader_path, shader = load("src/renderer/shadertoy.zig")
+
 # ──────────────────────────────────────────────────────────────────────
 # 1. Config.zig — add custom_shaders feature flag
 # ──────────────────────────────────────────────────────────────────────
-config_path = source_dir / "src/build/Config.zig"
-text = config_path.read_text()
-
-# Add field
-text = text.replace(
+config = replace_exact(
+    config,
     "sentry: bool = true,",
     f"sentry: bool = true,\ncustom_shaders: bool = true, // {marker}",
+    "Config.zig sentry field",
 )
 
-# Add option parsing after sentry block
 sentry_end = """    ) orelse sentry: {
         switch (target.result.os.tag) {
             .macos, .ios => break :sentry true,
@@ -50,32 +85,31 @@ new_options = sentry_end + """
         "Build with custom shader (glslang/spirv-cross) support.",
     ) orelse true;"""
 
-text = text.replace(sentry_end, new_options)
+config = replace_exact(config, sentry_end, new_options, "Config.zig sentry option block")
 
-# Add to addOptions
-text = text.replace(
+config = replace_exact(
+    config,
     'step.addOption(bool, "sentry", self.sentry);',
     'step.addOption(bool, "sentry", self.sentry);\n'
     '    step.addOption(bool, "custom_shaders", self.custom_shaders);',
+    "Config.zig addOptions",
 )
-
-config_path.write_text(text)
-print("[+] patched Config.zig")
 
 # ──────────────────────────────────────────────────────────────────────
 # 2. SharedDeps.zig — gate glslang + spirv-cross on custom_shaders
 # ──────────────────────────────────────────────────────────────────────
-shared_path = source_dir / "src/build/SharedDeps.zig"
-text = shared_path.read_text()
-
-# Gate glslang — wrap with custom_shaders check
-text = text.replace(
+shared = replace_exact(
+    shared,
     '    // Glslang\n    if (b.lazyDependency("glslang", .{',
     '    // Glslang — only needed for custom shaders\n    if (self.config.custom_shaders) if (b.lazyDependency("glslang", .{',
+    "SharedDeps.zig glslang open",
 )
-# Close the extra if at end of glslang block
-text = text.replace(
-    """            step.linkLibrary(glslang_dep.artifact("glslang"));
+
+# `if (cond) if (...) |x| {...}` is a statement and needs the trailing
+# semicolon; without it the file no longer parses.
+shared = replace_exact(
+    shared,
+    """            step.root_module.linkLibrary(glslang_dep.artifact("glslang"));
             try static_libs.append(
                 b.allocator,
                 glslang_dep.artifact("glslang").getEmittedBin(),
@@ -84,7 +118,7 @@ text = text.replace(
     }
 
     // Spirv-cross""",
-    """            step.linkLibrary(glslang_dep.artifact("glslang"));
+    """            step.root_module.linkLibrary(glslang_dep.artifact("glslang"));
             try static_libs.append(
                 b.allocator,
                 glslang_dep.artifact("glslang").getEmittedBin(),
@@ -93,15 +127,19 @@ text = text.replace(
     };
 
     // Spirv-cross""",
+    "SharedDeps.zig glslang close",
 )
 
-# Gate spirv-cross — wrap with custom_shaders check
-text = text.replace(
+shared = replace_exact(
+    shared,
     '    // Spirv-cross\n    if (b.lazyDependency("spirv_cross", .{',
     '    // Spirv-cross — only needed for custom shaders\n    if (self.config.custom_shaders) if (b.lazyDependency("spirv_cross", .{',
+    "SharedDeps.zig spirv-cross open",
 )
-text = text.replace(
-    """            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
+
+shared = replace_exact(
+    shared,
+    """            step.root_module.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
             try static_libs.append(
                 b.allocator,
                 spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
@@ -110,7 +148,7 @@ text = text.replace(
     }
 
     // Sentry""",
-    """            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
+    """            step.root_module.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
             try static_libs.append(
                 b.allocator,
                 spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
@@ -119,60 +157,47 @@ text = text.replace(
     };
 
     // Sentry""",
+    "SharedDeps.zig spirv-cross close",
 )
-
-shared_path.write_text(text)
-print("[+] patched SharedDeps.zig")
 
 # ──────────────────────────────────────────────────────────────────────
 # 3. build_config.zig — re-export custom_shaders flag
 # ──────────────────────────────────────────────────────────────────────
-bc_path = source_dir / "src/build_config.zig"
-text = bc_path.read_text()
-
-if "custom_shaders" not in text:
-    text = text.replace(
-        'const options = @import("build_options");',
-        'const options = @import("build_options");\npub const custom_shaders = options.custom_shaders;',
-    )
-    bc_path.write_text(text)
-    print("[+] patched build_config.zig")
+bc = replace_exact(
+    bc,
+    'const options = @import("build_options");',
+    'const options = @import("build_options");\npub const custom_shaders = options.custom_shaders;',
+    "build_config.zig options import",
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # 4. global.zig — conditional glslang init
 #    (global.zig already imports build_config)
 # ──────────────────────────────────────────────────────────────────────
-global_path = source_dir / "src/global.zig"
-text = global_path.read_text()
-
-text = text.replace(
+glob = replace_exact(
+    glob,
     'const glslang = @import("glslang");',
     'const glslang = if (build_config.custom_shaders) @import("glslang") else struct {\n'
     '    pub fn init() !void {}\n'
     '};',
+    "global.zig glslang import",
 )
-
-global_path.write_text(text)
-print("[+] patched global.zig")
 
 # ──────────────────────────────────────────────────────────────────────
 # 5. renderer/shadertoy.zig — gate shader imports and loadFromFile
 #    When custom_shaders is disabled, loadFromFile is unreachable
 #    so glslang/spirv_cross are never semantically analyzed
 # ──────────────────────────────────────────────────────────────────────
-shader_path = source_dir / "src/renderer/shadertoy.zig"
-text = shader_path.read_text()
-
-# Make imports conditional — these won't be analyzed if never reached
-text = text.replace(
+shader = replace_exact(
+    shader,
     'const glslang = @import("glslang");',
     'const build_config = @import("../build_config.zig");\n'
     'const glslang = @import("glslang");',
+    "shadertoy.zig glslang import",
 )
 
-# Add early return in loadFromFiles when custom_shaders is disabled
-# This prevents loadFromFile (and thus spirvFromGlsl etc) from being analyzed
-text = text.replace(
+shader = replace_exact(
+    shader,
     """pub fn loadFromFiles(
     alloc_gpa: Allocator,
     paths: configpkg.RepeatablePath,
@@ -186,10 +211,31 @@ text = text.replace(
 ) ![]const [:0]const u8 {
     if (comptime !build_config.custom_shaders) return &.{};
     var list: std.ArrayList([:0]const u8) = .empty;""",
+    "shadertoy.zig loadFromFiles guard",
 )
 
-shader_path.write_text(text)
-print("[+] patched renderer/shadertoy.zig")
+# Postconditions: the marker must be installed and every gate present.
+if marker not in config:
+    raise PatchError("postcondition: marker missing from Config.zig")
+for name, body, needle in (
+    ("SharedDeps.zig", shared, "if (self.config.custom_shaders) if (b.lazyDependency(\"glslang\""),
+    ("build_config.zig", bc, "pub const custom_shaders"),
+    ("global.zig", glob, "if (build_config.custom_shaders)"),
+    ("shadertoy.zig", shader, "if (comptime !build_config.custom_shaders)"),
+):
+    if needle not in body:
+        raise PatchError(f"postcondition failed in {name}")
+
+# All transformations succeeded — commit them.
+for path, body, label in (
+    (config_path, config, "Config.zig"),
+    (shared_path, shared, "SharedDeps.zig"),
+    (bc_path, bc, "build_config.zig"),
+    (global_path, glob, "global.zig"),
+    (shader_path, shader, "renderer/shadertoy.zig"),
+):
+    path.write_text(body)
+    print(f"[+] patched {label}")
 
 print(f"[+] all trim patches complete ({marker})")
 PYEOF

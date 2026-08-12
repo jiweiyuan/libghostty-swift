@@ -18,22 +18,46 @@ from pathlib import Path
 source_dir = Path(sys.argv[1])
 marker = sys.argv[2]
 
-def patch_file(rel_path, replacements):
+# Staged writes. Nothing reaches disk until every transformation below has
+# succeeded, so a late failure can never leave a half-patched tree sitting
+# behind an already-installed marker (which the next run would skip).
+pending = []
+
+
+def stage(path, text, label):
+    pending.append((path, text, label))
+
+
+def load(rel_path):
+    """Read a file that must exist. A missing file is an error, never a skip."""
     path = source_dir / rel_path
-    text = path.read_text()
+    if not path.is_file():
+        print(f"[-] missing file: {rel_path}")
+        sys.exit(1)
+    return path, path.read_text()
+
+
+def require(condition, message):
+    """Explicit check. Never use `assert` — `python -O` strips it."""
+    if not condition:
+        print(f"[-] {message}")
+        sys.exit(1)
+
+
+def replace_exact(text, old, new, what, expected=1):
+    found = text.count(old)
+    if found != expected:
+        print(f"[-] {what}: expected {expected} match(es), found {found}")
+        print(f"    {old[:80]}...")
+        sys.exit(1)
+    return text.replace(old, new, expected)
+
+
+def patch_file(rel_path, replacements):
+    path, text = load(rel_path)
     for old, new in replacements:
-        if old not in text:
-            print(f"[-] pattern not found in {rel_path}:")
-            print(f"    {old[:80]}...")
-            sys.exit(1)
-        count = text.count(old)
-        if count > 1:
-            print(f"[-] pattern matched {count} times in {rel_path} (expected 1):")
-            print(f"    {old[:80]}...")
-            sys.exit(1)
-        text = text.replace(old, new, 1)
-    path.write_text(text)
-    print(f"[+] patched {rel_path}")
+        text = replace_exact(text, old, new, f"{rel_path} pattern")
+    stage(path, text, rel_path)
 
 # ──────────────────────────────────────────────────────────────────────
 # 1. Config.zig — add inspector feature flag
@@ -114,8 +138,26 @@ patch_file("src/build_config.zig", [
 #    When inspector=false, stub types with no-op methods are provided
 #    so Surface.zig, renderer, termio all compile without modification.
 # ──────────────────────────────────────────────────────────────────────
-inspector_main = source_dir / "src/inspector/main.zig"
-inspector_main.write_text('''\
+inspector_main, inspector_main_old = load("src/inspector/main.zig")
+# This is a wholesale file replacement, so validate what we are discarding.
+# If upstream grows real content here, silently overwriting it would drop
+# their changes with no diff and no error.
+#
+# Upstream's version is a small re-export module (8 lines at 9d8fbd15b3b4).
+# Require that shape before discarding it: if upstream grows real logic here,
+# overwriting it would drop their changes with no diff and no error.
+require(
+    'pub const widgets = @import("widgets.zig");' in inspector_main_old
+    and 'pub const Inspector = @import("Inspector.zig");' in inspector_main_old,
+    "src/inspector/main.zig is not the expected upstream re-export module; "
+    "refusing to overwrite it",
+)
+require(
+    len(inspector_main_old.splitlines()) <= 20,
+    "src/inspector/main.zig grew beyond a re-export module "
+    f"({len(inspector_main_old.splitlines())} lines); review before overwriting",
+)
+inspector_main_new = ('''\
 const build_config = @import("../build_config.zig");
 const std = @import("std");
 const terminal = @import("../terminal/main.zig");
@@ -201,7 +243,7 @@ test {
     }
 }
 ''')
-print("[+] replaced src/inspector/main.zig with stub module")
+stage(inspector_main, inspector_main_new, "src/inspector/main.zig (stub module)")
 
 # ──────────────────────────────────────────────────────────────────────
 # 5. input/key.zig — gate dcimgui import + imguiKey method
@@ -222,19 +264,17 @@ patch_file("src/input/key.zig", [
 # ──────────────────────────────────────────────────────────────────────
 # 6. apprt/embedded.zig — gate Inspector struct + CoreInspector import
 # ──────────────────────────────────────────────────────────────────────
-embedded_path = source_dir / "src/apprt/embedded.zig"
-text = embedded_path.read_text()
+embedded_path, text = load("src/apprt/embedded.zig")
 
 # 6a. Gate CoreInspector import
 old = 'const CoreInspector = @import("../inspector/main.zig").Inspector;'
 new = 'const CoreInspector = if (@import("../build_config.zig").inspector) @import("../inspector/main.zig").Inspector else struct {};'
-assert old in text, f"pattern not found: {old}"
-text = text.replace(old, new, 1)
+text = replace_exact(text, old, new, "embedded.zig inspector import")
 
 # 6b. Gate the Inspector struct definition using brace-depth counting
 # Find the struct opening
 struct_marker = 'pub const Inspector = struct {\n    const cimgui = @import("dcimgui");'
-assert struct_marker in text, f"Inspector struct marker not found"
+require(struct_marker in text, "embedded.zig: Inspector struct marker not found")
 
 struct_start_idx = text.index('pub const Inspector = struct {\n    const cimgui = @import("dcimgui");')
 # Find the opening brace
@@ -301,8 +341,7 @@ new_init = """    pub fn initInspector(self: *Surface) !*Inspector {
         self.inspector = inspector;
         return inspector;
     }"""
-assert old_init in text, "initInspector pattern not found"
-text = text.replace(old_init, new_init, 1)
+text = replace_exact(text, old_init, new_init, "embedded.zig initInspector")
 
 # 6d. Gate freeInspector body
 old_free = """    pub fn freeInspector(self: *Surface) void {
@@ -320,8 +359,7 @@ new_free = """    pub fn freeInspector(self: *Surface) void {
             self.inspector = null;
         }
     }"""
-assert old_free in text, "freeInspector pattern not found"
-text = text.replace(old_free, new_free, 1)
+text = replace_exact(text, old_free, new_free, "embedded.zig freeInspector")
 
 # 6e. Gate CAPI inspector functions that call methods on Inspector
 # These functions take *Inspector and call methods that don't exist on the stub struct.
@@ -396,11 +434,29 @@ capi_guards = [
      '            if (ptr.backend) |v| {'),
 ]
 for old_capi, new_capi in capi_guards:
-    assert old_capi in text, f"CAPI pattern not found: {old_capi[:60]}..."
-    text = text.replace(old_capi, new_capi, 1)
+    text = replace_exact(text, old_capi, new_capi, f"embedded.zig CAPI {old_capi[:40]}")
 
-embedded_path.write_text(text)
-print("[+] patched apprt/embedded.zig")
+stage(embedded_path, text, "apprt/embedded.zig")
+
+# Postconditions before anything is written.
+staged = {label: body for _, body, label in pending}
+require(
+    marker in staged["src/build/Config.zig"],
+    "postcondition: marker missing from Config.zig",
+)
+require(
+    "pub const inspector = options.inspector;" in staged["src/build_config.zig"],
+    "postcondition: inspector flag not re-exported from build_config.zig",
+)
+require(
+    "if (self.config.inspector) if (b.lazyDependency(\"dcimgui\"" in staged["src/build/SharedDeps.zig"],
+    "postcondition: dcimgui not gated in SharedDeps.zig",
+)
+
+# All transformations succeeded — commit them.
+for path, body, label in pending:
+    path.write_text(body)
+    print(f"[+] patched {label}")
 
 print(f"[+] all inspector patches complete ({marker})")
 PYEOF

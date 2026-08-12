@@ -4,6 +4,53 @@ set -euo pipefail
 
 SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 
+# All five steps below used to run as independent per-file scripts: each one
+# wrote its file the moment it finished, several of their `str.replace` calls
+# had no match check at all, and a missing file was treated as "nothing to do".
+# A failure in step 3 therefore left steps 1 and 2 committed, and the next run
+# read those as already-applied. Everything is now one transaction: every
+# anchor is matched an exact number of times, and nothing is written until all
+# five steps have succeeded.
+
+python3 - "$SOURCE_DIR" <<'PYEOF'
+import sys
+from pathlib import Path
+
+source_dir = Path(sys.argv[1])
+
+pending = []
+messages = []
+
+
+def stage(path, text, label):
+    pending.append((path, text, label))
+
+
+def load(rel_path):
+    """Read a file that must exist. A missing file is an error, never a skip."""
+    path = source_dir / rel_path
+    if not path.is_file():
+        print(f"[-] missing file: {rel_path}")
+        sys.exit(1)
+    return path, path.read_text()
+
+
+def require(condition, message):
+    """Explicit check. Never use `assert` — `python -O` strips it."""
+    if not condition:
+        print(f"[-] {message}")
+        sys.exit(1)
+
+
+def replace_exact(text, old, new, what, expected=1):
+    found = text.count(old)
+    if found != expected:
+        print(f"[-] {what}: expected {expected} match(es), found {found}")
+        print(f"    {old[:80]}...")
+        sys.exit(1)
+    return text.replace(old, new, expected)
+
+
 # =============================================================================
 # Patch 1: IOSurfaceLayer — iOS rendering compatibility
 #
@@ -22,36 +69,42 @@ SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 # - Use CAIOSurfaceLayer as base class on iOS for native IOSurface compositing
 # - Mark layer as opaque since terminal content fills the entire bounds
 # =============================================================================
-IOSURFACE_LAYER="${SOURCE_DIR}/src/renderer/metal/IOSurfaceLayer.zig"
-if [ -f "$IOSURFACE_LAYER" ]; then
-    if grep -q 'const log = std.log.scoped(.IOSurfaceLayer);' "$IOSURFACE_LAYER"; then
-        python3 - "$IOSURFACE_LAYER" <<'PY'
-from pathlib import Path
-import sys
+layer_path, layer = load("src/renderer/metal/IOSurfaceLayer.zig")
+if "CAIOSurfaceLayer" in layer:
+    messages.append("[+] IOSurfaceLayer already patched")
+else:
+    # Need builtin for comptime os.tag checks
+    layer = replace_exact(
+        layer,
+        'const std = @import("std");\nconst Allocator = std.mem.Allocator;',
+        'const std = @import("std");\nconst builtin = @import("builtin");\n'
+        'const Allocator = std.mem.Allocator;',
+        "IOSurfaceLayer builtin import",
+    )
 
-path = Path(sys.argv[1])
-src = path.read_text()
+    # The scoped log is only used in the size check we're replacing; drop it
+    layer = replace_exact(
+        layer,
+        "\nconst log = std.log.scoped(.IOSurfaceLayer);\n",
+        "\n",
+        "IOSurfaceLayer scoped log",
+    )
 
-# Need builtin for comptime os.tag checks
-src = src.replace(
-    'const std = @import("std");\nconst Allocator = std.mem.Allocator;',
-    'const std = @import("std");\nconst builtin = @import("builtin");\nconst Allocator = std.mem.Allocator;'
-)
+    # Terminal surface is always fully opaque — tell the compositor
+    layer = replace_exact(
+        layer,
+        'layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);'
+        "\n\n    layer.setInstanceVariable",
+        'layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);'
+        '\n    layer.setProperty("opaque", true);\n\n    layer.setInstanceVariable',
+        "IOSurfaceLayer opaque property",
+    )
 
-# The scoped log is only used in the size check we're replacing; drop it
-src = src.replace('\nconst log = std.log.scoped(.IOSurfaceLayer);\n', '\n')
-
-# Terminal surface is always fully opaque — tell the compositor
-src = src.replace(
-    'layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);\n\n    layer.setInstanceVariable',
-    'layer.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);\n    layer.setProperty("opaque", true);\n\n    layer.setInstanceVariable'
-)
-
-# Replace the strict size equality check with a platform-aware version.
-# On iOS, UIKit's point→pixel rounding can produce a 1px discrepancy.
-# Rather than dropping the frame entirely (→ blank screen), we accept it
-# and recalculate contentsScale so CoreAnimation stretches correctly.
-old_block = """    if (width != surface.getWidth() or height != surface.getHeight()) {
+    # Replace the strict size equality check with a platform-aware version.
+    # On iOS, UIKit's point→pixel rounding can produce a 1px discrepancy.
+    # Rather than dropping the frame entirely (→ blank screen), we accept it
+    # and recalculate contentsScale so CoreAnimation stretches correctly.
+    old_block = """    if (width != surface.getWidth() or height != surface.getHeight()) {
         log.debug(
             "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
             .{ surface.getWidth(), surface.getHeight(), width, height },
@@ -59,7 +112,7 @@ old_block = """    if (width != surface.getWidth() or height != surface.getHeigh
         return;
     }"""
 
-new_block = """    const sw = surface.getWidth();
+    new_block = """    const sw = surface.getWidth();
     const sh = surface.getHeight();
     const dw: usize = if (width > sw) width - sw else sw - width;
     const dh: usize = if (height > sh) height - sh else sh - height;
@@ -83,20 +136,19 @@ new_block = """    const sw = surface.getWidth();
         }
     }"""
 
-if old_block not in src:
-    print("[!] IOSurfaceLayer size check block not found — source may have changed")
-    sys.exit(1)
-src = src.replace(old_block, new_block)
+    layer = replace_exact(
+        layer, old_block, new_block, "IOSurfaceLayer size check block"
+    )
 
-# Use the system-provided CAIOSurfaceLayer on iOS; it handles
-# IOSurface display natively with zero-copy compositing.
-old_cls = """    const CALayer =
+    # Use the system-provided CAIOSurfaceLayer on iOS; it handles
+    # IOSurface display natively with zero-copy compositing.
+    old_cls = """    const CALayer =
         objc.getClass("CALayer") orelse return error.ObjCFailed;
 
     var subclass =
         objc.allocateClassPair(CALayer, "IOSurfaceLayer") orelse return error.ObjCFailed;"""
 
-new_cls = """    const parent_cls = if (comptime builtin.os.tag == .ios)
+    new_cls = """    const parent_cls = if (comptime builtin.os.tag == .ios)
         // CAIOSurfaceLayer provides native zero-copy IOSurface compositing
         objc.getClass("CAIOSurfaceLayer") orelse
             objc.getClass("CALayer") orelse return error.ObjCFailed
@@ -106,15 +158,20 @@ new_cls = """    const parent_cls = if (comptime builtin.os.tag == .ios)
     var subclass =
         objc.allocateClassPair(parent_cls, "IOSurfaceLayer") orelse return error.ObjCFailed;"""
 
-src = src.replace(old_cls, new_cls)
+    layer = replace_exact(
+        layer, old_cls, new_cls, "IOSurfaceLayer objc parent class"
+    )
 
-path.write_text(src)
-print("[+] patched IOSurfaceLayer: iOS size tolerance + CAIOSurfaceLayer")
-PY
-    else
-        echo "[+] IOSurfaceLayer already patched"
-    fi
-fi
+    # Dropping the scoped log declaration is only safe if nothing else used it.
+    require(
+        "log." not in layer,
+        "postcondition: IOSurfaceLayer still references the removed scoped log",
+    )
+
+    stage(layer_path, layer, "src/renderer/metal/IOSurfaceLayer.zig")
+    messages.append(
+        "[+] patched IOSurfaceLayer: iOS size tolerance + CAIOSurfaceLayer"
+    )
 
 # =============================================================================
 # Patch 2: Metal.zig — iOS first-frame display + synchronous present
@@ -134,23 +191,17 @@ fi
 # - On iOS, always use the synchronous present path (setSurface checks
 #   isMainThread internally and runs inline when true)
 # =============================================================================
-METAL_ZIG="${SOURCE_DIR}/src/renderer/Metal.zig"
-if [ -f "$METAL_ZIG" ]; then
-    if ! grep -q 'setNeedsDisplay' "$METAL_ZIG"; then
-        python3 - "$METAL_ZIG" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-src = path.read_text()
-
-# Kick the first display cycle after callback registration on iOS
-old_cb = """        @ptrCast(&displayCallback),
+metal_path, metal = load("src/renderer/Metal.zig")
+if "setNeedsDisplay" in metal:
+    messages.append("[+] Metal.zig already patched")
+else:
+    # Kick the first display cycle after callback registration on iOS
+    old_cb = """        @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
 }"""
 
-new_cb = """        @ptrCast(&displayCallback),
+    new_cb = """        @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
 
@@ -161,13 +212,10 @@ new_cb = """        @ptrCast(&displayCallback),
     }
 }"""
 
-if old_cb not in src:
-    print("[!] Metal loopEnter callback not found")
-    sys.exit(1)
-src = src.replace(old_cb, new_cb)
+    metal = replace_exact(metal, old_cb, new_cb, "Metal.zig loopEnter callback")
 
-# iOS render loop is main-thread; skip the async dispatch path entirely.
-old_present = """pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+    # iOS render loop is main-thread; skip the async dispatch path entirely.
+    old_present = """pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
     } else {
@@ -175,7 +223,7 @@ old_present = """pub inline fn present(self: *Metal, target: Target, sync: bool)
     }
 }"""
 
-new_present = """pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+    new_present = """pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     // iOS: always present synchronously — the render loop already runs on
     // the main thread, so the async GCD hop is unnecessary overhead.
     if (comptime builtin.os.tag == .ios) {
@@ -189,18 +237,12 @@ new_present = """pub inline fn present(self: *Metal, target: Target, sync: bool)
     }
 }"""
 
-if old_present not in src:
-    print("[!] Metal present function not found")
-    sys.exit(1)
-src = src.replace(old_present, new_present)
+    metal = replace_exact(
+        metal, old_present, new_present, "Metal.zig present function"
+    )
 
-path.write_text(src)
-print("[+] patched Metal.zig: iOS first-frame trigger + sync present")
-PY
-    else
-        echo "[+] Metal.zig already patched"
-    fi
-fi
+    stage(metal_path, metal, "src/renderer/Metal.zig")
+    messages.append("[+] patched Metal.zig: iOS first-frame trigger + sync present")
 
 # =============================================================================
 # Patch 3: coretext.zig — Skip CF release thread on iOS
@@ -217,24 +259,20 @@ fi
 # and the terminal doesn't produce the same volume of shaped text as a
 # desktop compositor.
 # =============================================================================
-CORETEXT="${SOURCE_DIR}/src/font/shaper/coretext.zig"
-if [ -f "$CORETEXT" ]; then
-    if grep -q 'cf_release_thread: \*CFReleaseThread,' "$CORETEXT"; then
-        python3 - "$CORETEXT" <<'PY'
-from pathlib import Path
-import sys
+coretext_path, coretext = load("src/font/shaper/coretext.zig")
+if "cf_release_thread: ?*CFReleaseThread," in coretext:
+    messages.append("[+] coretext.zig already patched")
+else:
+    # Make the struct fields optional so nil can represent "no thread"
+    coretext = replace_exact(
+        coretext,
+        "cf_release_thread: *CFReleaseThread,\n    cf_release_thr: std.Thread,",
+        "cf_release_thread: ?*CFReleaseThread,\n    cf_release_thr: ?std.Thread,",
+        "coretext CF release thread fields",
+    )
 
-path = Path(sys.argv[1])
-src = path.read_text()
-
-# Make the struct fields optional so nil can represent "no thread"
-src = src.replace(
-    'cf_release_thread: *CFReleaseThread,\n    cf_release_thr: std.Thread,',
-    'cf_release_thread: ?*CFReleaseThread,\n    cf_release_thr: ?std.Thread,'
-)
-
-# Guard thread creation behind a comptime platform check
-old_create = """        // Create the CF release thread.
+    # Guard thread creation behind a comptime platform check
+    old_create = """        // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
         errdefer alloc.destroy(cf_release_thread);
         cf_release_thread.* = try .init(alloc);
@@ -246,11 +284,11 @@ old_create = """        // Create the CF release thread.
             CFReleaseThread.threadMain,
             .{cf_release_thread},
         );
-        cf_release_thr.setName("cf_release") catch {};
+        cf_release_thr.setName(global.io(), "cf_release") catch {};
 
         return .{"""
 
-new_create = """        // On iOS the kqueue-based event loop used by the release thread
+    new_create = """        // On iOS the kqueue-based event loop used by the release thread
         // crashes due to Mach port sandbox restrictions. Skip it entirely
         // and fall through to synchronous release in endFrame.
         var cf_release_thread: ?*CFReleaseThread = null;
@@ -261,20 +299,22 @@ new_create = """        // On iOS the kqueue-based event loop used by the releas
             thr_obj.* = try .init(alloc);
             errdefer thr_obj.deinit();
             const thr = try std.Thread.spawn(.{}, CFReleaseThread.threadMain, .{thr_obj});
-            thr.setName("cf_release") catch {};
+            thr.setName(global.io(), "cf_release") catch {};
             cf_release_thread = thr_obj;
             cf_release_thr = thr;
         }
 
         return .{"""
 
-if old_create not in src:
-    print("[!] coretext CF release thread creation block not found")
-    sys.exit(1)
-src = src.replace(old_create, new_create)
+    coretext = replace_exact(
+        coretext,
+        old_create,
+        new_create,
+        "coretext CF release thread creation block",
+    )
 
-# Deinit: only join/stop the thread if it was created
-old_deinit = """        // Stop the CF release thread
+    # Deinit: only join/stop the thread if it was created
+    old_deinit = """        // Stop the CF release thread
         {
             self.cf_release_thread.stop.notify() catch |err|
                 log.err("error notifying cf release thread to stop, may stall err={}", .{err});
@@ -283,7 +323,7 @@ old_deinit = """        // Stop the CF release thread
         self.cf_release_thread.deinit();
         self.alloc.destroy(self.cf_release_thread);"""
 
-new_deinit = """        // Stop the CF release thread (nil on iOS)
+    new_deinit = """        // Stop the CF release thread (nil on iOS)
         if (self.cf_release_thread) |thr_obj| {
             thr_obj.stop.notify() catch |err|
                 log.err("error notifying cf release thread to stop, may stall err={}", .{err});
@@ -292,17 +332,19 @@ new_deinit = """        // Stop the CF release thread (nil on iOS)
             self.alloc.destroy(thr_obj);
         }"""
 
-if old_deinit not in src:
-    print("[!] coretext CF release thread deinit block not found")
-    sys.exit(1)
-src = src.replace(old_deinit, new_deinit)
+    coretext = replace_exact(
+        coretext,
+        old_deinit,
+        new_deinit,
+        "coretext CF release thread deinit block",
+    )
 
-# endFrame: guard the mailbox push behind an optional check.
-# When nil (iOS), fall through to the synchronous release below.
-old_end = """        // Send the items. If the send succeeds then we wake up the
+    # endFrame: guard the mailbox push behind an optional check.
+    # When nil (iOS), fall through to the synchronous release below.
+    old_end = """        // Send the items. If the send succeeds then we wake up the
         // thread to process the items. If the send fails then do a manual
         // cleanup.
-        if (self.cf_release_thread.mailbox.push(.{ .release = .{
+        if (self.cf_release_thread.mailbox.push(global.io(), .{ .release = .{
             .refs = items,
             .alloc = self.alloc,
         } }, .{ .forever = {} }) != 0) {
@@ -317,10 +359,10 @@ old_end = """        // Send the items. If the send succeeds then we wake up the
 
         for (items) |ref| macos.foundation.CFRelease(ref);"""
 
-new_end = """        // Offload to the background release thread when available.
+    new_end = """        // Offload to the background release thread when available.
         // On iOS cf_release_thread is nil, so we fall through to sync release.
         if (self.cf_release_thread) |thr_obj| {
-            if (thr_obj.mailbox.push(.{ .release = .{
+            if (thr_obj.mailbox.push(global.io(), .{ .release = .{
                 .refs = items,
                 .alloc = self.alloc,
             } }, .{ .forever = {} }) != 0) {
@@ -336,18 +378,19 @@ new_end = """        // Offload to the background release thread when available.
 
         for (items) |ref| macos.foundation.CFRelease(ref);"""
 
-if old_end not in src:
-    print("[!] coretext endFrame mailbox block not found")
-    sys.exit(1)
-src = src.replace(old_end, new_end)
+    coretext = replace_exact(
+        coretext, old_end, new_end, "coretext endFrame mailbox block"
+    )
 
-path.write_text(src)
-print("[+] patched coretext.zig: CF release thread disabled on iOS")
-PY
-    else
-        echo "[+] coretext.zig already patched"
-    fi
-fi
+    # Every remaining use must go through the optional; a bare field access
+    # would not compile once the fields became optional.
+    require(
+        "self.cf_release_thread." not in coretext,
+        "postcondition: coretext.zig still dereferences cf_release_thread directly",
+    )
+
+    stage(coretext_path, coretext, "src/font/shaper/coretext.zig")
+    messages.append("[+] patched coretext.zig: CF release thread disabled on iOS")
 
 # =============================================================================
 # Patch 4: iosurface.zig — Explicit row byte alignment
@@ -361,39 +404,32 @@ fi
 # when creating the IOSurface. Also suppress unused return value warnings
 # from IOSurfaceLock/Unlock.
 # =============================================================================
-IOSURFACE="${SOURCE_DIR}/pkg/macos/iosurface/iosurface.zig"
-if [ -f "$IOSURFACE" ]; then
-    if ! grep -q 'kIOSurfaceBytesPerRow' "$IOSURFACE"; then
-        python3 - "$IOSURFACE" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-src = path.read_text()
-
-# Compute aligned row stride before creating the Number objects
-old_start = """    pub fn init(properties: Properties) Allocator.Error!*IOSurface {
+iosurface_path, iosurface = load("pkg/macos/iosurface/iosurface.zig")
+if "kIOSurfaceBytesPerRow" in iosurface:
+    messages.append("[+] iosurface.zig already patched")
+else:
+    # Compute aligned row stride before creating the Number objects
+    old_start = """    pub fn init(properties: Properties) Allocator.Error!*IOSurface {
         var w = try foundation.Number.create(.int, &properties.width);"""
 
-new_start = """    pub fn init(properties: Properties) Allocator.Error!*IOSurface {
+    new_start = """    pub fn init(properties: Properties) Allocator.Error!*IOSurface {
         // Ensure row stride is 64-byte aligned for Metal texture compatibility.
         const aligned_stride: c_int = @intCast(
             (properties.width * properties.bytes_per_element + 63) & ~@as(c_int, 63),
         );
         var w = try foundation.Number.create(.int, &properties.width);"""
 
-if old_start not in src:
-    print("[!] iosurface init start not found")
-    sys.exit(1)
-src = src.replace(old_start, new_start)
+    iosurface = replace_exact(
+        iosurface, old_start, new_start, "iosurface init start"
+    )
 
-# Create a Number for the stride and include it in the dictionary
-old_dict_setup = """        var bpe = try foundation.Number.create(.int, &properties.bytes_per_element);
+    # Create a Number for the stride and include it in the dictionary
+    old_dict_setup = """        var bpe = try foundation.Number.create(.int, &properties.bytes_per_element);
         defer bpe.release();
 
         var properties_dict = try foundation.Dictionary.create("""
 
-new_dict_setup = """        var bpe = try foundation.Number.create(.int, &properties.bytes_per_element);
+    new_dict_setup = """        var bpe = try foundation.Number.create(.int, &properties.bytes_per_element);
         defer bpe.release();
 
         var stride_num = try foundation.Number.create(.int, &aligned_stride);
@@ -401,13 +437,12 @@ new_dict_setup = """        var bpe = try foundation.Number.create(.int, &proper
 
         var properties_dict = try foundation.Dictionary.create("""
 
-if old_dict_setup not in src:
-    print("[!] iosurface bpe block not found")
-    sys.exit(1)
-src = src.replace(old_dict_setup, new_dict_setup)
+    iosurface = replace_exact(
+        iosurface, old_dict_setup, new_dict_setup, "iosurface bpe block"
+    )
 
-# Extend the dictionary keys/values arrays
-old_dict = """            &[_]?*const anyopaque{
+    # Extend the dictionary keys/values arrays
+    old_dict = """            &[_]?*const anyopaque{
                 c.kIOSurfaceWidth,
                 c.kIOSurfaceHeight,
                 c.kIOSurfacePixelFormat,
@@ -415,7 +450,7 @@ old_dict = """            &[_]?*const anyopaque{
             },
             &[_]?*const anyopaque{ w, h, pf, bpe },"""
 
-new_dict = """            &[_]?*const anyopaque{
+    new_dict = """            &[_]?*const anyopaque{
                 c.kIOSurfaceWidth,
                 c.kIOSurfaceHeight,
                 c.kIOSurfacePixelFormat,
@@ -424,50 +459,72 @@ new_dict = """            &[_]?*const anyopaque{
             },
             &[_]?*const anyopaque{ w, h, pf, bpe, stride_num },"""
 
-if old_dict not in src:
-    print("[!] iosurface dictionary keys not found")
+    iosurface = replace_exact(
+        iosurface, old_dict, new_dict, "iosurface dictionary keys"
+    )
+
+    # Silence unused return value from IOSurfaceLock/Unlock
+    iosurface = replace_exact(
+        iosurface,
+        "        c.IOSurfaceLock(\n            @ptrCast(self),\n            0,\n            null,\n        );",
+        "        _ = c.IOSurfaceLock(\n            @ptrCast(self),\n            0,\n            null,\n        );",
+        "iosurface IOSurfaceLock discard",
+    )
+    iosurface = replace_exact(
+        iosurface,
+        "        c.IOSurfaceUnlock(\n            @ptrCast(self),\n            0,\n            null,\n        );",
+        "        _ = c.IOSurfaceUnlock(\n            @ptrCast(self),\n            0,\n            null,\n        );",
+        "iosurface IOSurfaceUnlock discard",
+    )
+
+    stage(iosurface_path, iosurface, "pkg/macos/iosurface/iosurface.zig")
+    messages.append("[+] patched iosurface.zig: 64-byte stride alignment for Metal")
+
+# =============================================================================
+# Patch 5: build.zig.zon — libxev pin for the iOS kqueue mach port panic
+#
+# The bundled libxev used mach ports for async wakeup on Darwin, and its
+# kqueue backend returned null for mach port kevents on non-macOS Darwin
+# (iOS); the caller then unwrapped that null and panicked. This step repinned
+# libxev to mitchellh/libxev@7e7d2f2 which handles iOS correctly.
+#
+# Upstream ghostty has since repinned libxev itself, so neither our old URL nor
+# our old hash exists any more and this step had become a silent no-op that
+# still printed success. Recognize the exact upstream pin we verified as
+# carrying the fix, and fail on anything we do not recognize.
+# =============================================================================
+zon_path, zon = load("build.zig.zon")
+old_url = '"https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz"'
+new_url = '"https://github.com/mitchellh/libxev/archive/7e7d2f2ab4700544657f8ec268715c8ef320d839.tar.gz"'
+old_hash = '"libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs"'
+new_hash = '"libxev-0.0.0-86vtcwE9EwB942iWRnaNMXHv3n0BeLAs_tVhrs5cT8cQ"'
+upstream_url = '"https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz"'
+upstream_hash = '"libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F"'
+
+if new_url in zon and new_hash in zon:
+    messages.append("[+] libxev already updated")
+elif old_url in zon:
+    zon = replace_exact(zon, old_url, new_url, "build.zig.zon libxev url")
+    zon = replace_exact(zon, old_hash, new_hash, "build.zig.zon libxev hash")
+    stage(zon_path, zon, "build.zig.zon")
+    messages.append("[+] patched build.zig.zon: updated libxev for iOS mach port fix")
+elif upstream_url in zon and upstream_hash in zon:
+    messages.append(
+        "[+] libxev repin not applicable: upstream already pins libxev 9ce8e8e"
+    )
+else:
+    print(
+        "[-] build.zig.zon: libxev is pinned to an unrecognized revision; "
+        "re-verify the iOS mach port fix and update this patch"
+    )
     sys.exit(1)
-src = src.replace(old_dict, new_dict)
 
-# Silence unused return value from IOSurfaceLock/Unlock
-src = src.replace(
-    '        c.IOSurfaceLock(\n            @ptrCast(self),\n            0,\n            null,\n        );',
-    '        _ = c.IOSurfaceLock(\n            @ptrCast(self),\n            0,\n            null,\n        );'
-)
-src = src.replace(
-    '        c.IOSurfaceUnlock(\n            @ptrCast(self),\n            0,\n            null,\n        );',
-    '        _ = c.IOSurfaceUnlock(\n            @ptrCast(self),\n            0,\n            null,\n        );'
-)
+# All transformations succeeded — commit them.
+for path, body, _ in pending:
+    path.write_text(body)
 
-path.write_text(src)
-print("[+] patched iosurface.zig: 64-byte stride alignment for Metal")
-PY
-    else
-        echo "[+] iosurface.zig already patched"
-    fi
-fi
-
-# =============================================================================
-# Patch 5: build.zig.zon — Update libxev to fix iOS kqueue mach port panic
-#
-# Problem: The bundled libxev uses mach ports for async wakeup on Darwin.
-# Its kqueue backend checks `os.tag != .macos` and returns null for mach port
-# kevents on non-macOS Darwin (iOS). The caller then unwraps null with `.?`
-# causing a panic. A newer libxev version fixes this by properly supporting
-# iOS as a Darwin target.
-#
-# Fix: Update the libxev dependency URL and hash to a version that handles
-# iOS mach ports correctly.
-# =============================================================================
-BUILD_ZON="${SOURCE_DIR}/build.zig.zon"
-if [ -f "$BUILD_ZON" ]; then
-    if ! grep -q '7e7d2f2ab4700544657f8ec268715c8ef320d839' "$BUILD_ZON"; then
-        sed -i '' 's|"https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz"|"https://github.com/mitchellh/libxev/archive/7e7d2f2ab4700544657f8ec268715c8ef320d839.tar.gz"|' "$BUILD_ZON"
-        sed -i '' 's|"libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs"|"libxev-0.0.0-86vtcwE9EwB942iWRnaNMXHv3n0BeLAs_tVhrs5cT8cQ"|' "$BUILD_ZON"
-        echo "[+] patched build.zig.zon: updated libxev for iOS mach port fix"
-    else
-        echo "[+] libxev already updated"
-    fi
-fi
+for message in messages:
+    print(message)
+PYEOF
 
 echo "[+] all ios metal rendering patches applied"

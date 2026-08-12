@@ -15,81 +15,138 @@ SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 #
 # -Wno-macro-redefined: zig predefines the macro to 0 on its own command
 # line; our -D override redefines it.
+#
+# All three insertions used to be blind perl/python substitutions on an anchor
+# that appears more than once per file; the flag grep afterwards only proved
+# *something* was inserted, not that it landed in the right list. Each anchor
+# below is now matched exactly once, and nothing is written until all three
+# succeed.
 
-# Patch 1: highway flags (hwy/abort.cc et al reference __libcpp_verbose_abort
-# through the -fno-exceptions throw helpers)
-HIGHWAY_BUILD="${SOURCE_DIR}/pkg/highway/build.zig"
-if [ ! -f "$HIGHWAY_BUILD" ]; then
-    echo "[-] missing: $HIGHWAY_BUILD; upstream changed, update this patch"
-    exit 1
-fi
-if ! grep -q '_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS' "$HIGHWAY_BUILD"; then
-    perl -0pi -e 's/try flags\.appendSlice\(b\.allocator, &\.\{\n/try flags.appendSlice(b.allocator, &.{\n        "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n        "-Wno-macro-redefined",\n/' "$HIGHWAY_BUILD"
-    grep -q '_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS' "$HIGHWAY_BUILD" || {
-        echo "[-] highway flags block not found; upstream changed, update this patch"
-        exit 1
-    }
-    echo "[+] patched: highway libc++ availability annotations"
-else
-    echo "[+] highway libc++ availability already patched"
-fi
-
-# Patch 2: simdutf flags
-SIMDUTF_BUILD="${SOURCE_DIR}/pkg/simdutf/build.zig"
-if [ ! -f "$SIMDUTF_BUILD" ]; then
-    echo "[-] missing: $SIMDUTF_BUILD; upstream changed, update this patch"
-    exit 1
-fi
-if ! grep -q '_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS' "$SIMDUTF_BUILD"; then
-    perl -0pi -e 's/try flags\.appendSlice\(b\.allocator, &\.\{\n/try flags.appendSlice(b.allocator, &.{\n        "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n        "-Wno-macro-redefined",\n/' "$SIMDUTF_BUILD"
-    grep -q '_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS' "$SIMDUTF_BUILD" || {
-        echo "[-] simdutf flags block not found; upstream changed, update this patch"
-        exit 1
-    }
-    echo "[+] patched: simdutf libc++ availability annotations"
-else
-    echo "[+] simdutf libc++ availability already patched"
-fi
-
-# Patch 3: ghostty's own C++ SIMD sources (src/simd/*.cpp)
-SHARED_DEPS="${SOURCE_DIR}/src/build/SharedDeps.zig"
-if [ ! -f "$SHARED_DEPS" ]; then
-    echo "[-] missing: $SHARED_DEPS; upstream changed, update this patch"
-    exit 1
-fi
-if ! grep -q '_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS' "$SHARED_DEPS"; then
-    python3 - "$SHARED_DEPS" <<'PY'
-from pathlib import Path
+python3 - "$SOURCE_DIR" <<'PYEOF'
 import sys
+from pathlib import Path
 
-path = Path(sys.argv[1])
-text = path.read_text()
+source_dir = Path(sys.argv[1])
 
-# Upstream (ghostty 2da015c+) builds the src/simd C++ flags into a runtime
-# `flags` ArrayList instead of a static per-arch array literal, so we inject
-# our two flags right after that list is initialized — this covers every
-# architecture, matching the old both-branches patch.
-anchor = "        var flags: std.ArrayListUnmanaged([]const u8) = .empty;\n"
+FLAG = "_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS"
 
-inject = (
-    "        // libghostty-spm: honor Apple libc++ vendor availability annotations\n"
-    "        // so the C++ SIMD sources degrade gracefully below our deployment\n"
-    "        // floors instead of dyld-crashing on a too-new symbol.\n"
-    '        try flags.appendSlice(b.allocator, &.{\n'
-    '            "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n'
-    '            "-Wno-macro-redefined",\n'
-    "        });\n"
-)
+# Staged writes. Nothing reaches disk until every transformation has succeeded,
+# so a late failure can never leave a partially patched tree that the next run
+# reads as "already applied".
+pending = []
+messages = []
 
-if anchor not in text:
-    print("[-] src/simd flags anchor not found; upstream changed, update this patch")
-    sys.exit(1)
 
-path.write_text(text.replace(anchor, anchor + inject, 1))
-print("[+] patched: src/simd libc++ availability annotations")
-PY
-else
-    echo "[+] src/simd libc++ availability already patched"
-fi
+def stage(path, text, label):
+    pending.append((path, text, label))
+
+
+def load(rel_path):
+    """Read a file that must exist. A missing file is an error, never a skip."""
+    path = source_dir / rel_path
+    if not path.is_file():
+        print(f"[-] missing: {path}; upstream changed, update this patch")
+        sys.exit(1)
+    return path, path.read_text()
+
+
+def require(condition, message):
+    """Explicit check. Never use `assert` — `python -O` strips it."""
+    if not condition:
+        print(f"[-] {message}")
+        sys.exit(1)
+
+
+def replace_exact(text, old, new, what, expected=1):
+    found = text.count(old)
+    if found != expected:
+        print(f"[-] {what}: expected {expected} match(es), found {found}")
+        print(f"    {old[:80]}...")
+        sys.exit(1)
+    return text.replace(old, new, expected)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 1. highway flags (hwy/abort.cc et al reference __libcpp_verbose_abort
+#    through the -fno-exceptions throw helpers)
+# ──────────────────────────────────────────────────────────────────────
+highway_path, highway = load("pkg/highway/build.zig")
+if FLAG in highway:
+    messages.append("[+] highway libc++ availability already patched")
+else:
+    # `try flags.appendSlice(b.allocator, &.{` alone occurs three times in this
+    # file; the following comment pins it to the top-level flag list.
+    highway = replace_exact(
+        highway,
+        '    try flags.appendSlice(b.allocator, &.{\n'
+        '        // Highway can avoid libc++ entirely as long as all users compile\n',
+        '    try flags.appendSlice(b.allocator, &.{\n'
+        '        "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n'
+        '        "-Wno-macro-redefined",\n'
+        '        // Highway can avoid libc++ entirely as long as all users compile\n',
+        "highway flags block",
+    )
+    stage(highway_path, highway, "pkg/highway/build.zig")
+    messages.append("[+] patched: highway libc++ availability annotations")
+
+# ──────────────────────────────────────────────────────────────────────
+# 2. simdutf flags
+# ──────────────────────────────────────────────────────────────────────
+simdutf_path, simdutf = load("pkg/simdutf/build.zig")
+if FLAG in simdutf:
+    messages.append("[+] simdutf libc++ availability already patched")
+else:
+    simdutf = replace_exact(
+        simdutf,
+        '    try flags.appendSlice(b.allocator, &.{\n'
+        '        "-fno-sanitize=undefined",\n',
+        '    try flags.appendSlice(b.allocator, &.{\n'
+        '        "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n'
+        '        "-Wno-macro-redefined",\n'
+        '        "-fno-sanitize=undefined",\n',
+        "simdutf flags block",
+    )
+    stage(simdutf_path, simdutf, "pkg/simdutf/build.zig")
+    messages.append("[+] patched: simdutf libc++ availability annotations")
+
+# ──────────────────────────────────────────────────────────────────────
+# 3. ghostty's own C++ SIMD sources (src/simd/*.cpp)
+#
+#    Upstream (ghostty 2da015c+) builds the src/simd C++ flags into a runtime
+#    `flags` ArrayList instead of a static per-arch array literal, so we inject
+#    our two flags right after that list is initialized — this covers every
+#    architecture, matching the old both-branches patch.
+# ──────────────────────────────────────────────────────────────────────
+shared_path, shared = load("src/build/SharedDeps.zig")
+if FLAG in shared:
+    messages.append("[+] src/simd libc++ availability already patched")
+else:
+    anchor = "        var flags: std.ArrayListUnmanaged([]const u8) = .empty;\n"
+    inject = (
+        "        // libghostty-spm: honor Apple libc++ vendor availability annotations\n"
+        "        // so the C++ SIMD sources degrade gracefully below our deployment\n"
+        "        // floors instead of dyld-crashing on a too-new symbol.\n"
+        '        try flags.appendSlice(b.allocator, &.{\n'
+        '            "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=1",\n'
+        '            "-Wno-macro-redefined",\n'
+        "        });\n"
+    )
+    shared = replace_exact(
+        shared, anchor, anchor + inject, "src/simd flags anchor"
+    )
+    stage(shared_path, shared, "src/build/SharedDeps.zig")
+    messages.append("[+] patched: src/simd libc++ availability annotations")
+
+# Postconditions before anything is written.
+for _, body, label in pending:
+    require(FLAG in body, f"postcondition: {FLAG} missing from {label}")
+
+# All transformations succeeded — commit them.
+for path, body, _ in pending:
+    path.write_text(body)
+
+for message in messages:
+    print(message)
+PYEOF
 
 echo "[+] all libcxx-apple-availability patches applied"
