@@ -246,6 +246,63 @@ else:
 # Both steps above edit the same file, so it is staged once, after both.
 stage(config_path, config, "src/build/Config.zig")
 
+# ──────────────────────────────────────────────────────────────────────
+# 5. Compile the Metal shaders for iOS again
+#
+#    The same removal took the iOS arms out of MetallibStep.create, so it
+#    returns null for iOS and SharedDeps then unwraps it:
+#    "panic: attempt to use null value" at `self.metallib.?`. The renderer
+#    is Metal on both Apple platforms, so the arms go back verbatim.
+# ──────────────────────────────────────────────────────────────────────
+metallib_path, metallib = load("src/build/MetallibStep.zig")
+
+metallib_hunks = [
+    (
+        """    const sdk = switch (opts.target.result.os.tag) {
+        .macos => "macosx",
+""",
+        """        .ios => switch (opts.target.result.abi) {
+            // The iOS simulator uses the same SDK for Metal as the device,
+            // but the minimum version tag causes different behaviors.
+            .simulator => "iphoneos",
+            else => "iphoneos",
+        },
+""",
+        "MetallibStep sdk switch",
+    ),
+    (
+        """    const platform_version_arg = switch (opts.target.result.os.tag) {
+        .macos => "-mmacos-version-min",
+""",
+        """        .ios => switch (opts.target.result.abi) {
+            .simulator => "-mios-simulator-version-min",
+            else => "-mios-version-min",
+        },
+""",
+        "MetallibStep platform version switch",
+    ),
+    (
+        """    else switch (opts.target.result.os.tag) {
+        .macos => "10.14",
+""",
+        """        .ios => "11.0",
+""",
+        "MetallibStep minimum version switch",
+    ),
+]
+
+if '"iphoneos"' in metallib:
+    messages.append("[+] Metal shader compilation for iOS already restored")
+else:
+    for anchor, addition, what in metallib_hunks:
+        metallib = replace_exact(metallib, anchor, anchor + addition, what)
+    require(
+        "-mios-version-min" in metallib,
+        "postcondition: MetallibStep still has no iOS platform version",
+    )
+    stage(metallib_path, metallib, "src/build/MetallibStep.zig")
+    messages.append("[+] patched: Metal shaders compile for iOS again")
+
 # All transformations succeeded — commit them.
 for path, body, _ in pending:
     path.write_text(body)
