@@ -15,7 +15,6 @@ SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 # and nothing is written to disk until all four steps have succeeded.
 
 python3 - "$SOURCE_DIR" <<'PYEOF'
-import re
 import sys
 from pathlib import Path
 
@@ -177,36 +176,75 @@ else:
     sys.exit(1)
 
 # ──────────────────────────────────────────────────────────────────────
-# 4. Lower the iOS deployment target to 15.0
+# 4. Keep iOS a buildable target for the full libghostty
+#
+#    Upstream removed iOS from the Ghostty app in ghostty#13759/#13760: the
+#    Xcode target, the xcframework packaging, and the iOS prong of
+#    osVersionMin are gone, and `Config.init` now refuses `.ios` outright
+#    unless the build is -Demit-lib-vt. This fork builds the *full*
+#    libghostty for iOS — the companion mirror is a live surface, not a VT
+#    snapshot — so both have to be put back:
+#
+#      a. drop the refusal, which is a policy check and not a capability one
+#      b. reinstate an iOS deployment target, since osVersionMin(.ios) now
+#         returns null and the target would build with no minimum at all
 # ──────────────────────────────────────────────────────────────────────
 config_path, config = load("src/build/Config.zig")
-ios_semver = re.compile(
-    r"\.ios => \.\{ \.semver = \.\{\n"
-    r"\s*\.major = \d+,\n"
-    r"\s*\.minor = \d+,\n"
-    r"\s*\.patch = \d+,"
-)
-ios_target = (
-    ".ios => .{ .semver = .{\n"
-    "            .major = 15,\n"
-    "            .minor = 0,\n"
-    "            .patch = 0,"
-)
-ios_matches = ios_semver.findall(config)
-require(
-    len(ios_matches) == 1,
-    f"Config.zig iOS semver block: expected 1 match, found {len(ios_matches)}",
-)
-if ios_matches[0] == ios_target:
+
+ios_guard = """        // The full Ghostty build no longer supports iOS; Fail early
+        // with a clear message rather than partway through the build.
+        if (result.result.os.tag == .ios and !emit_lib_vt) {
+            std.log.err(
+                "iOS is not a supported target for the full Ghostty build; " ++
+                    "only libghostty-vt supports iOS (-Demit-lib-vt)",
+                .{},
+            );
+            return error.UnsupportedTarget;
+        }
+
+"""
+
+if ios_guard in config:
+    config = config.replace(ios_guard, "", 1)
+    require(
+        "UnsupportedTarget" not in config,
+        "postcondition: iOS target refusal still present in Config.zig",
+    )
+    messages.append("[+] patched: dropped the iOS build refusal")
+elif "UnsupportedTarget" not in config:
+    messages.append("[+] iOS build refusal already dropped")
+else:
+    print("[-] Config.zig still refuses a target but the known guard is gone")
+    sys.exit(1)
+
+ios_min = """        .ios => .{ .semver = .{
+            .major = 15,
+            .minor = 0,
+            .patch = 0,
+        } },
+
+"""
+macos_min_anchor = """        .macos => .{ .semver = .{
+            .major = 13,
+            .minor = 0,
+            .patch = 0,
+        } },
+
+"""
+
+if ios_min in config:
     messages.append("[+] iOS deployment target already patched")
 else:
-    config = ios_semver.sub(lambda _: ios_target, config, count=1)
-    require(
-        ios_target in config,
-        "postcondition: iOS deployment target not lowered in Config.zig",
+    config = replace_exact(
+        config,
+        macos_min_anchor,
+        macos_min_anchor + ios_min,
+        "Config.zig osVersionMin macOS prong",
     )
-    stage(config_path, config, "src/build/Config.zig")
     messages.append("[+] patched: iOS deployment target -> 15.0")
+
+# Both steps above edit the same file, so it is staged once, after both.
+stage(config_path, config, "src/build/Config.zig")
 
 # All transformations succeeded — commit them.
 for path, body, _ in pending:
